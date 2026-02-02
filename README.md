@@ -16,7 +16,7 @@ Rust trait system best practices, patterns, and idiomatic usage for AI coding ag
 ## Install
 
 ```bash
-npx skills add <owner>/rust-traits-skill
+npx skills add ArthurDEV44/rust-traits-skill
 ```
 
 ## License
