@@ -20,6 +20,7 @@ Collection of AI coding agent skills by [ArthurDEV44](https://github.com/ArthurD
 | [rust-traits](skills/rust-traits) | Trait system best practices, patterns, and idiomatic usage |
 | [tanstack-form](skills/tanstack-form) | TanStack Form: state management, validation, and submission handling |
 | [tanstack-query](skills/tanstack-query) | TanStack Query v5: data fetching, caching, mutations, and SSR |
+| [tsl-webgpu](skills/tsl-webgpu) | TSL (Three.js Shading Language) and WebGPU: shaders, compute, node materials |
 
 ## Install
 
