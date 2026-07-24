@@ -2,7 +2,46 @@
 
 Public collection of Agent Skills used by Arthur across Codex, Claude Code, and other compatible coding agents.
 
-## Install
+## Install the CLI
+
+Install the native CLI through the npm registry with Node.js 18 or newer:
+
+```bash
+npm install --global @arthjean/skills
+```
+
+Bun can run the package without a separate Node.js installation:
+
+```bash
+bunx --bun --package @arthjean/skills@latest arthur-skills \
+  plan --provider claude --provider codex
+```
+
+With Node.js available, pnpm and Bun can also install the global launcher:
+
+```bash
+pnpm add --global @arthjean/skills
+bun add --global @arthjean/skills
+```
+
+The package contains the native binaries for every supported platform. It does not compile Rust or
+clone this repository during installation.
+
+Review the immutable plan, then apply the same provider selection:
+
+```bash
+arthur-skills plan --provider claude --provider codex
+arthur-skills install --provider claude --provider codex
+arthur-skills doctor
+```
+
+Update the CLI by installing the latest package:
+
+```bash
+npm install --global @arthjean/skills@latest
+```
+
+### Install skills only
 
 Install from GitHub with the [`skills` CLI](https://github.com/vercel-labs/skills):
 
@@ -28,13 +67,18 @@ Install globally instead of in the current project:
 bunx skills add arthjean/skills --global
 ```
 
-## Native installer
+The `skills` CLI installs skills, but not the Claude and Codex agent definitions bundled with
+`arthur-skills`.
 
-The `arthur-skills` binary embeds the complete runtime catalog and requires no JavaScript runtime after compilation. Rust 1.95.0 is pinned at the repository root.
+### Standalone installer
+
+Use the standalone installer when a JavaScript runtime or package manager is unavailable. The
+`arthur-skills` binary embeds the complete runtime catalog and requires no JavaScript runtime after
+installation. Rust 1.95.0 is pinned at the repository root.
 
 ```bash
 # Pin acquisition to a release, then verify the downloaded checksum file before execution.
-ARTHUR_SKILLS_VERSION=v0.1.0
+ARTHUR_SKILLS_VERSION=v0.2.0
 curl --proto '=https' --tlsv1.2 -LsSf \
   "https://github.com/arthjean/skills/releases/download/${ARTHUR_SKILLS_VERSION}/arthur-skills-installer.sh" \
   -o arthur-skills-installer.sh
@@ -42,11 +86,15 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   "https://github.com/arthjean/skills/releases/download/${ARTHUR_SKILLS_VERSION}/sha256.sum" \
   -o sha256.sum
 grep ' arthur-skills-installer.sh$' sha256.sum > arthur-skills-installer.sh.sha256
-sha256sum --check arthur-skills-installer.sh.sha256
+if command -v sha256sum >/dev/null; then
+  sha256sum --check arthur-skills-installer.sh.sha256
+else
+  shasum -a 256 --check arthur-skills-installer.sh.sha256
+fi
 sh arthur-skills-installer.sh
 ```
 
-Release `v0.1.0` is the documented contract target; use a published tag and its `sha256.sum` manifest rather than an unpinned main-branch installer. For local development:
+Use a published tag and its `sha256.sum` manifest rather than an unpinned main-branch installer. For local development:
 
 ```bash
 cargo run -p arthur-skills -- --help
@@ -56,7 +104,7 @@ cargo build --release -p arthur-skills
 On Windows, use the signed release inputs from PowerShell:
 
 ```powershell
-$Version = "v0.1.0"
+$Version = "v0.2.0"
 $Base = "https://github.com/arthjean/skills/releases/download/$Version"
 Invoke-WebRequest "$Base/arthur-skills-installer.ps1" -OutFile arthur-skills-installer.ps1
 Invoke-WebRequest "$Base/sha256.sum" -OutFile sha256.sum
@@ -68,13 +116,8 @@ if ($Observed -ne $Expected) { throw "Installer checksum mismatch" }
 & .\arthur-skills-installer.ps1
 ```
 
-The installation command surface is `plan`, `install`, `status`, `doctor`, `update`, `uninstall`, `adopt`, and `recover`. Start by reviewing the immutable plan, then apply the same provider selection:
-
-```bash
-arthur-skills plan --provider claude --provider codex
-arthur-skills install --provider claude --provider codex
-arthur-skills doctor
-```
+The installation command surface is `plan`, `install`, `status`, `doctor`, `update`, `uninstall`,
+`adopt`, and `recover`.
 
 Repository maintainers can inspect and synchronize the vendored third-party skills without changing an installed workflow:
 
@@ -98,6 +141,7 @@ The JSON v1 status set is closed: `success`, `noop`, `blocked`, `failed`, or `re
 - [`agents/claude/`](agents/claude/) mirrors the agents optimized for Claude Code.
 - [`agents/codex/`](agents/codex/) mirrors the agents optimized for Codex, including their evaluation suite.
 - [`crates/arthur-skills/`](crates/arthur-skills/) contains the native CLI and build-time catalog validator.
+- [`npm/`](npm/) contains the dependency-free package launcher. Release staging injects the verified native binaries.
 - [`shared/claude/skills/_shared/`](shared/claude/skills/_shared/) contains packaged Claude workflow support documents.
 
 The `skills` CLI does not install these agent files.

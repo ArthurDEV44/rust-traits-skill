@@ -25,6 +25,75 @@ fn string_array<'a>(table: &'a toml::Table, key: &str) -> Vec<&'a str> {
 }
 
 #[test]
+fn npm_package_is_a_dependency_free_native_launcher() -> TestResult {
+    let package = fs::read_to_string(workspace().join("npm/package.json"))?;
+    let package = serde_json::from_str::<serde_json::Value>(&package)?;
+    assert_eq!(package["name"], "@arthjean/skills");
+    assert_eq!(package["version"], "0.0.0-dev");
+    assert_eq!(package["private"], true);
+    assert_eq!(package["bin"]["arthur-skills"], "bin/arthur-skills.js");
+    assert_eq!(package["engines"]["node"], ">=18");
+    assert!(package.get("dependencies").is_none());
+    assert!(package.get("optionalDependencies").is_none());
+    assert!(package["files"].as_array().is_some_and(|files| {
+        ["bin", "lib", "vendor"]
+            .iter()
+            .all(|required| files.iter().any(|entry| entry == required))
+    }));
+
+    let target = fs::read_to_string(workspace().join("npm/lib/target.js"))?;
+    for contract in [
+        "[\"linux:x64\", \"x86_64-unknown-linux-musl\"]",
+        "[\"linux:arm64\", \"aarch64-unknown-linux-musl\"]",
+        "[\"darwin:x64\", \"x86_64-apple-darwin\"]",
+        "[\"darwin:arm64\", \"aarch64-apple-darwin\"]",
+        "[\"win32:x64\", \"x86_64-pc-windows-msvc\"]",
+    ] {
+        assert!(
+            target.contains(contract),
+            "missing target mapping: {contract}"
+        );
+    }
+
+    let launcher = fs::read_to_string(workspace().join("npm/bin/arthur-skills.js"))?;
+    for contract in [
+        "spawn(binaryPath, process.argv.slice(2)",
+        "stdio: \"inherit\"",
+        "child.kill(signal)",
+        "process.off(signal, handler)",
+        "process.kill(process.pid, result.signal)",
+        "process.exit(result.exitCode)",
+    ] {
+        assert!(
+            launcher.contains(contract),
+            "missing launcher contract: {contract}"
+        );
+    }
+
+    let staging = fs::read_to_string(workspace().join("scripts/stage-npm-package.sh"))?;
+    for contract in [
+        "cp \"$repository_root/LICENSE\"",
+        "cp \"$repository_root/README.md\"",
+        "cp \"$repository_root/THIRD_PARTY.md\"",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "unzip -q \"$archive\"",
+        "tar -xJf \"$archive\"",
+        "chmod 755",
+    ] {
+        assert!(
+            staging.contains(contract),
+            "missing npm staging contract: {contract}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn cargo_dist_configuration_covers_native_artifacts_and_provenance() -> TestResult {
     let source = fs::read_to_string(workspace().join("dist-workspace.toml"))?;
     let document = source.parse::<toml::Table>()?;
@@ -99,6 +168,18 @@ fn workflow_gates_every_native_archive_before_draft_publication() -> TestResult 
         "trap cleanup_smoke EXIT",
         "test -s target/distrib/sha256.sum",
         "sha256sum --check --strict sha256.sum",
+        "bash scripts/stage-npm-package.sh",
+        "bun pm pack",
+        "arthur-skills-npm-${version}.tgz",
+        "package/vendor/x86_64-unknown-linux-musl/arthur-skills",
+        "package/vendor/x86_64-pc-windows-msvc/arthur-skills.exe",
+        "publish-npm:",
+        "needs: [plan, publish]",
+        "id-token: write",
+        "npm publish \"arthur-skills-npm-${version}.tgz\"",
+        "--provenance",
+        "publish_args+=(--tag next)",
+        "npm view \"@arthjean/skills@${version}\" version",
         "*pc-windows-msvc.zip",
         "*installer.ps1",
         "rm -f target/distrib/*-dist-manifest.json",
@@ -137,6 +218,7 @@ fn workflow_gates_every_native_archive_before_draft_publication() -> TestResult 
 
     let ordered_gates = [
         "sha256sum --check --strict sha256.sum",
+        "- name: Stage and smoke the npm package",
         "- name: Attest every release artifact",
         "- name: Require the attestation created by this gate",
         "- name: Verify provenance before publication",
