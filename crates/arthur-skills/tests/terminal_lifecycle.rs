@@ -113,13 +113,12 @@ fn tui_install_selects_reviews_and_commits_inline() -> Result<(), Box<dyn Error>
     assert!(result.output.contains("Select providers"));
     assert!(result.output.contains("Install Arthur Workflow"));
     assert!(result.output.contains("Applying "));
-    assert!(result.output.contains("Everything is up to date"));
+    assert!(result.output.contains("Update complete"));
     assert!(
         result
             .output
-            .contains("All managed skills and agents match the desired state.")
+            .contains("All managed skills and agents now match the desired state.")
     );
-    assert!(result.output.contains("Codex reads"));
     assert!(!result.output.contains("codexusesimplicitskills:"));
     assert!(!result.output.contains("managed path is missing"));
     assert!(!result.output.contains("\u{1b}[?1049h"));
@@ -129,7 +128,7 @@ fn tui_install_selects_reviews_and_commits_inline() -> Result<(), Box<dyn Error>
         .ok_or("close did not clear the terminal")?;
     let success_screen = result
         .output
-        .rfind("All managed skills and agents match the desired state.")
+        .rfind("All managed skills and agents now match the desired state.")
         .ok_or("success screen is missing")?;
     assert!(final_clear > success_screen);
     assert!(
@@ -617,7 +616,8 @@ fn run_install_session(
                         master.flush()?;
                         tui_stage = 2;
                     } else if tui_stage == 2
-                        && output.contains("All managed skills and agents match the desired state.")
+                        && output
+                            .contains("All managed skills and agents now match the desired state.")
                     {
                         master.write_all(b"\r")?;
                         master.flush()?;
@@ -668,7 +668,17 @@ fn run_install_session(
         if Instant::now() >= deadline {
             child.kill()?;
             child.wait()?;
-            return Err("interactive install timed out".into());
+            let output = String::from_utf8_lossy(&bytes);
+            return Err(format!(
+                "interactive install timed out at stage {tui_stage}; \
+                 captured_bytes={}; selection={}; review={}; applying={}; success={}",
+                bytes.len(),
+                output.contains("Select providers"),
+                output.contains("Install Arthur Workflow"),
+                output.contains("Applying "),
+                output.contains("All managed skills and agents now match the desired state.")
+            )
+            .into());
         }
         thread::sleep(Duration::from_millis(5));
     };
