@@ -8,7 +8,7 @@ allow-dirty = ["ci"]
 ci = ["github"]
 pr-run-mode = "plan"
 installers = ["shell", "powershell"]
-include = ["LICENSE", "README.md", "THIRD_PARTY.md"]
+include = ["LICENSE", "LICENSE-APACHE-2.0", "README.md", "THIRD_PARTY.md"]
 targets = [
   "x86_64-unknown-linux-musl",
   "aarch64-unknown-linux-musl",

@@ -78,7 +78,7 @@ installation. Rust 1.95.0 is pinned at the repository root.
 
 ```bash
 # Pin acquisition to a release, then verify the downloaded checksum file before execution.
-ARTHUR_SKILLS_VERSION=v0.2.0
+ARTHUR_SKILLS_VERSION=v0.2.1
 curl --proto '=https' --tlsv1.2 -LsSf \
   "https://github.com/arthjean/skills/releases/download/${ARTHUR_SKILLS_VERSION}/arthur-skills-installer.sh" \
   -o arthur-skills-installer.sh
@@ -104,7 +104,7 @@ cargo build --release -p arthur-skills
 On Windows, use the signed release inputs from PowerShell:
 
 ```powershell
-$Version = "v0.2.0"
+$Version = "v0.2.1"
 $Base = "https://github.com/arthjean/skills/releases/download/$Version"
 Invoke-WebRequest "$Base/arthur-skills-installer.ps1" -OutFile arthur-skills-installer.ps1
 Invoke-WebRequest "$Base/sha256.sum" -OutFile sha256.sum

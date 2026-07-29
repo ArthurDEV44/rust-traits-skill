@@ -185,7 +185,7 @@
         {
           "name": "ui-ux-pro-max",
           "tree_sha1": "37bb3804d0aeac9f08c0408d791b7abbb6ff8bdc",
-          "content_sha256": "ffa4d50b0b1a1a466218464b58a7b44519b1f5b018955a644c5805ed1fa9a71d"
+          "content_sha256": "f0b7a9fbba54985c76c2cfd0652f79b1a76e6f4d38eb16e6ba6661982637facf"
         }
       ]
     },
@@ -197,6 +197,17 @@
           "name": "remotion-best-practices",
           "tree_sha1": "6ba691f85c4691e9ba931cf328626b35bba88603",
           "content_sha256": "b24beb61ed7ebecc0ead3dd837f96691d4f7881ea2366b5369f3fe95cc15609b"
+        }
+      ]
+    },
+    {
+      "id": "vercel-labs/agent-browser",
+      "revision": "6dcea79b4b567a5671f1e1164807204f69542a5c",
+      "skills": [
+        {
+          "name": "agent-browser",
+          "tree_sha1": "037e8078db4b20b4aa25c04f21c6de7d335ec449",
+          "content_sha256": "4e6032399171d1ee19e92fb968e2930531829dfdb6408770afd30c4007680e02"
         }
       ]
     },

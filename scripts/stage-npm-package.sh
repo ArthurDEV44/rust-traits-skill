@@ -38,6 +38,7 @@ cp "$package_source/lib/target.js" "$stage_root/lib/target.js"
 cp "$package_source/tests/launcher.test.js" "$stage_root/tests/launcher.test.js"
 cp "$package_source/tests/target.test.js" "$stage_root/tests/target.test.js"
 cp "$repository_root/LICENSE" "$stage_root/LICENSE"
+cp "$repository_root/LICENSE-APACHE-2.0" "$stage_root/LICENSE-APACHE-2.0"
 cp "$repository_root/README.md" "$stage_root/README.md"
 cp "$repository_root/THIRD_PARTY.md" "$stage_root/THIRD_PARTY.md"
 

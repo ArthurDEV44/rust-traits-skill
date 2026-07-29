@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "skills": [
+    "agent-browser",
     "baseline-ui",
     "better-auth-best-practices",
     "better-auth-security-best-practices",
@@ -51,6 +52,7 @@
     "ui-ux-pro-max",
     "vercel-cli",
     "wayfinder",
+    "write-agent-guidance",
     "write-prd",
     "writing-great-skills"
   ],

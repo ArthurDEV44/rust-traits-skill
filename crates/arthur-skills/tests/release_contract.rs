@@ -73,6 +73,7 @@ fn npm_package_is_a_dependency_free_native_launcher() -> TestResult {
     let staging = fs::read_to_string(workspace().join("scripts/stage-npm-package.sh"))?;
     for contract in [
         "cp \"$repository_root/LICENSE\"",
+        "cp \"$repository_root/LICENSE-APACHE-2.0\"",
         "cp \"$repository_root/README.md\"",
         "cp \"$repository_root/THIRD_PARTY.md\"",
         "x86_64-unknown-linux-musl",
@@ -116,7 +117,12 @@ fn cargo_dist_configuration_covers_native_artifacts_and_provenance() -> TestResu
     assert_eq!(string_array(dist, "installers"), ["shell", "powershell"]);
     assert_eq!(
         string_array(dist, "include"),
-        ["LICENSE", "README.md", "THIRD_PARTY.md"]
+        [
+            "LICENSE",
+            "LICENSE-APACHE-2.0",
+            "README.md",
+            "THIRD_PARTY.md",
+        ]
     );
     assert_eq!(
         string_array(dist, "targets"),
@@ -154,7 +160,7 @@ fn workflow_gates_every_native_archive_before_draft_publication() -> TestResult 
         "dist print-upload-files-from-manifest --manifest dist-manifest.json",
         "archives=(target/distrib/*-\"$TARGET\".tar.xz)",
         "$archives = @(Get-ChildItem \"target/distrib/*-$env:TARGET.zip\")",
-        "for required in arthur-skills LICENSE README.md THIRD_PARTY.md",
+        "for required in arthur-skills LICENSE LICENSE-APACHE-2.0 README.md THIRD_PARTY.md",
         "arthur-skills.exe",
         "! -type f",
         "cd \"$smoke_work\"",

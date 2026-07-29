@@ -218,14 +218,14 @@ jobs:
           package_root="$(find "$smoke_root" -mindepth 1 -maxdepth 1 -type d -print -quit)"
           test -n "$package_root"
           test "$(find "$smoke_root" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')" -eq 1
-          test "$(find "$package_root" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')" -eq 4
+          test "$(find "$package_root" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')" -eq 5
           test "$(find "$package_root" -mindepth 1 -maxdepth 1 ! -type f | wc -l | tr -d '[:space:]')" -eq 0
-          for required in arthur-skills LICENSE README.md THIRD_PARTY.md; do
+          for required in arthur-skills LICENSE LICENSE-APACHE-2.0 README.md THIRD_PARTY.md; do
             test -f "$package_root/$required"
           done
           binary="$package_root/arthur-skills"
           test -x "$binary"
-          for metadata in LICENSE README.md THIRD_PARTY.md; do
+          for metadata in LICENSE LICENSE-APACHE-2.0 README.md THIRD_PARTY.md; do
             test ! -x "$package_root/$metadata"
           done
           if LC_ALL=C grep -aERq 'agents/codex/evals|/home/arthur|/Users/arthur|-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}' "$package_root"; then
@@ -297,10 +297,10 @@ jobs:
             $packageRoot = $rootEntries[0].FullName
           }
           $entries = @(Get-ChildItem -LiteralPath $packageRoot)
-          if ($entries.Count -ne 4 -or @($entries | Where-Object { $_.PSIsContainer }).Count -ne 0) {
-            throw "Archive package must contain exactly four regular files"
+          if ($entries.Count -ne 5 -or @($entries | Where-Object { $_.PSIsContainer }).Count -ne 0) {
+            throw "Archive package must contain exactly five regular files"
           }
-          foreach ($required in @("arthur-skills.exe", "LICENSE", "README.md", "THIRD_PARTY.md")) {
+          foreach ($required in @("arthur-skills.exe", "LICENSE", "LICENSE-APACHE-2.0", "README.md", "THIRD_PARTY.md")) {
             if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $required) -PathType Leaf)) {
               throw "Missing release file: $required"
             }
@@ -441,7 +441,7 @@ jobs:
           test -s "$tarball"
           test "$(wc -c < "$tarball" | tr -d '[:space:]')" -le 26214400
           listing="$(tar -tzf "$tarball")"
-          if grep -Eq '(^/|(^|/)\.\.(/|$)|package/tests/|package/vendor/.+/(README.md|LICENSE|THIRD_PARTY.md))' <<<"$listing"; then
+          if grep -Eq '(^/|(^|/)\.\.(/|$)|package/tests/|package/vendor/.+/(README.md|LICENSE|LICENSE-APACHE-2.0|THIRD_PARTY.md))' <<<"$listing"; then
             echo "::error title=Unsafe npm package::package contains a forbidden path"
             exit 1
           fi
@@ -450,6 +450,7 @@ jobs:
             package/bin/arthur-skills.js \
             package/lib/target.js \
             package/LICENSE \
+            package/LICENSE-APACHE-2.0 \
             package/README.md \
             package/THIRD_PARTY.md \
             package/vendor/x86_64-unknown-linux-musl/arthur-skills \
