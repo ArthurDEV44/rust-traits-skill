@@ -62,11 +62,11 @@ fn apply(
     transition: &LifecycleDecision,
     transaction_id: &str,
 ) -> TestResult {
-    let operations =
+    let transaction =
         operations_for_plan(&transition.plan, roots, &transition.receipt, transaction_id)?;
     let engine = TransactionEngine::new(roots.state_directory.clone(), SignalFlags::default());
     assert_eq!(
-        engine.apply(transaction_id, operations)?,
+        engine.apply(transaction_id, transaction.operations, &transaction.claims)?,
         TransactionOutcome::Committed
     );
     Ok(())
@@ -441,7 +441,7 @@ fn import_and_reconciliation_repair_catalog_assets_without_claiming_personal_ass
     }));
     assert!(imported.receipt.owned_asset(&personal).is_none());
 
-    let operations = operations_for_import(
+    let transaction = operations_for_import(
         &imported.plan,
         &import_roots.legacy_lock_path,
         Some(&legacy),
@@ -452,7 +452,11 @@ fn import_and_reconciliation_repair_catalog_assets_without_claiming_personal_ass
     let engine =
         TransactionEngine::new(import_roots.state_directory.clone(), SignalFlags::default());
     assert_eq!(
-        engine.apply("import-existing", operations)?,
+        engine.apply(
+            "import-existing",
+            transaction.operations,
+            &transaction.claims
+        )?,
         TransactionOutcome::Committed
     );
     assert_eq!(fs::read(&personal)?, b"personal");
@@ -766,7 +770,7 @@ fn uninstall_failure_rolls_back_assets_and_receipt_together() -> TestResult {
         &LifecycleRequest::UninstallProvider(ProviderId::Claude),
         &LegacyEvidence::Absent,
     )?;
-    let operations = operations_for_plan(
+    let transaction = operations_for_plan(
         &transition.plan,
         &roots,
         &transition.receipt,
@@ -776,7 +780,12 @@ fn uninstall_failure_rolls_back_assets_and_receipt_together() -> TestResult {
     let mut injector = FailAfterMutation::new(8);
     assert!(
         engine
-            .apply_with("rollback-uninstall", operations, &mut injector)
+            .apply_with(
+                "rollback-uninstall",
+                transaction.operations,
+                &transaction.claims,
+                &mut injector,
+            )
             .is_err()
     );
     assert_eq!(fs::read(&claude_agent)?, before_agent);

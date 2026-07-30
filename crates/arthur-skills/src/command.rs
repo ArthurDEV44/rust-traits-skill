@@ -13,7 +13,9 @@ use crate::app::{App, Review};
 use crate::catalog::{AssetKind, Catalog};
 use crate::cli::{Cli, Command, ConfirmationArgs, MutationArgs, ProviderArgs, UninstallArgs};
 use crate::lifecycle::{LegacyEvidence, LifecycleDecision, LifecycleRequest, decide};
-use crate::operations::{operations_for_adoption, operations_for_import, operations_for_plan};
+use crate::operations::{
+    OperationBuildError, operations_for_adoption, operations_for_import, operations_for_plan,
+};
 use crate::output::{
     CONFLICT_EXIT_CODE, Envelope, OutputDiagnostic, OutputSeverity, OutputStatus, path_fields,
 };
@@ -24,8 +26,8 @@ use crate::provider::{
 };
 use crate::receipt::{Receipt, ReceiptState};
 use crate::transaction::{
-    PathKind, RootSpec, SignalFlags, TRANSACTION_EXIT_CODE, TransactionEngine, TransactionOutcome,
-    snapshot_path,
+    PathKind, RootSpec, STALE_LIFECYCLE_DECISION, SignalFlags, TRANSACTION_EXIT_CODE,
+    TransactionEngine, TransactionError, TransactionOutcome, snapshot_path,
 };
 use crate::ui::{self, UiExit};
 use crate::workflow::{WorkflowAssessment, assess_decision};
@@ -587,14 +589,17 @@ fn run_adopt(
             return transaction_error("adopt", providers, TRANSACTION_EXIT_CODE, message);
         }
     };
-    let operations = match operations_for_adoption(
+    let transaction = match operations_for_adoption(
         &roots.legacy_lock_path,
         &adoption,
         &roots,
         &next_receipt,
         &transaction_id,
     ) {
-        Ok(operations) => operations,
+        Ok(transaction) => transaction,
+        Err(OperationBuildError::StalePlan(path)) => {
+            return stale_decision("adopt", providers, &path);
+        }
         Err(error) => {
             return transaction_error("adopt", providers, TRANSACTION_EXIT_CODE, error.to_string());
         }
@@ -609,7 +614,11 @@ fn run_adopt(
         return transaction_error("adopt", providers, TRANSACTION_EXIT_CODE, error.to_string());
     }
     let engine = TransactionEngine::new(roots.state_directory, signals.clone());
-    match engine.apply(transaction_id.clone(), operations) {
+    match engine.apply(
+        transaction_id.clone(),
+        transaction.operations,
+        &transaction.claims,
+    ) {
         Ok(TransactionOutcome::Committed) => {
             envelope.transaction_id = Some(transaction_id);
             envelope.data = json!({ "adopted": adoption.entries.len(), "applied": true });
@@ -621,6 +630,9 @@ fn run_adopt(
             TRANSACTION_EXIT_CODE,
             format!("unexpected adoption outcome: {outcome:?}"),
         ),
+        Err(TransactionError::StaleLifecycleDecision(path)) => {
+            stale_decision("adopt", providers, &path)
+        }
         Err(error) => transaction_error("adopt", providers, error.exit_code(), error.to_string()),
     }
 }
@@ -806,8 +818,11 @@ fn apply_decision(
     } else {
         operations_for_plan(&decision.plan, &roots, &decision.receipt, &transaction_id)
     };
-    let operations = match operations_result {
-        Ok(operations) => operations,
+    let transaction = match operations_result {
+        Ok(transaction) => transaction,
+        Err(OperationBuildError::StalePlan(path)) => {
+            return stale_decision(command, decision.selected_providers, &path);
+        }
         Err(error) => {
             return transaction_error(
                 command,
@@ -818,7 +833,7 @@ fn apply_decision(
         }
     };
     if !cli.json
-        && let Err(error) = write_apply_progress(operations.len())
+        && let Err(error) = write_apply_progress(transaction.operations.len())
     {
         return transaction_error(
             command,
@@ -828,7 +843,11 @@ fn apply_decision(
         );
     }
     let engine = TransactionEngine::new(roots.state_directory, signals.clone());
-    match engine.apply(transaction_id.clone(), operations) {
+    match engine.apply(
+        transaction_id.clone(),
+        transaction.operations,
+        &transaction.claims,
+    ) {
         Ok(TransactionOutcome::Committed) => {
             envelope.transaction_id = Some(transaction_id);
             envelope.data = json!({ "applied": true, "result": "committed" });
@@ -840,6 +859,10 @@ fn apply_decision(
             TRANSACTION_EXIT_CODE,
             format!("unexpected apply outcome: {outcome:?}"),
         ),
+        // Nothing was mutated: the decision is refused, not failed.
+        Err(TransactionError::StaleLifecycleDecision(path)) => {
+            stale_decision(command, decision.selected_providers, &path)
+        }
         Err(error) => transaction_error(
             command,
             decision.selected_providers,
@@ -1159,6 +1182,27 @@ fn lifecycle_error(command: &str, providers: Vec<ProviderId>, message: String) -
     envelope
 }
 
+/// Refuses a decision whose preconditions no longer hold, without mutating.
+///
+/// The lifecycle contract separates this outcome from a transaction failure: no
+/// byte was written, so the caller reviews a new plan instead of recovering.
+fn stale_decision(command: &str, providers: Vec<ProviderId>, destination: &Path) -> Envelope {
+    let (path_utf8, path_bytes_hex) = path_fields(destination);
+    let mut envelope = Envelope::new(Some(command));
+    envelope.status = OutputStatus::Blocked;
+    envelope.exit_code = CONFLICT_EXIT_CODE;
+    envelope.providers = providers;
+    envelope.diagnostics.push(
+        OutputDiagnostic::error(
+            STALE_LIFECYCLE_DECISION,
+            format!("asset changed after planning: {}", destination.display()),
+            Some("Review a new plan before applying this change.".to_owned()),
+        )
+        .with_path(path_utf8, path_bytes_hex),
+    );
+    envelope
+}
+
 fn transaction_error(
     command: &str,
     providers: Vec<ProviderId>,
@@ -1237,17 +1281,20 @@ fn presentation(cli: &Cli) -> Presentation {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
 
     use super::{
         Presentation, adoption_entries, adoption_source_id, cancelled, compare_cli_versions,
-        environment_error, lifecycle_error, recovery_required, transaction_error, trusted_roots,
+        environment_error, lifecycle_error, recovery_required, stale_decision, transaction_error,
+        trusted_roots,
     };
     use crate::lifecycle::{LifecycleDecision, LifecycleRequest, ReceiptChange};
-    use crate::output::OutputStatus;
+    use crate::output::{CONFLICT_EXIT_CODE, OutputStatus};
     use crate::plan::{Owner, OwnershipClaim, Plan, PlanAction, PlanEntry, PlanReason};
     use crate::provider::{PathDiagnostic, ProviderId, ResolveError, resolve_roots_from};
     use crate::receipt::Receipt;
     use crate::should_use_tui;
+    use crate::transaction::{STALE_LIFECYCLE_DECISION, TransactionError};
 
     #[test]
     fn tui_selection_requires_compatible_terminal_streams() {
@@ -1313,6 +1360,27 @@ mod tests {
         let recovery = recovery_required("update", vec![ProviderId::Codex]);
         assert_eq!(recovery.status, OutputStatus::RecoveryRequired);
         assert_eq!(recovery.providers, vec![ProviderId::Codex]);
+
+        // A decision refused before any mutation is a conflict, not a failure:
+        // it names the exact destination and an executable remediation.
+        let stale = stale_decision(
+            "update",
+            vec![ProviderId::Claude],
+            Path::new("/home/tester/.agents/skills/example/SKILL.md"),
+        );
+        assert_eq!(stale.status, OutputStatus::Blocked);
+        assert_eq!(stale.exit_code, CONFLICT_EXIT_CODE);
+        assert_eq!(stale.providers, vec![ProviderId::Claude]);
+        assert_eq!(stale.diagnostics[0].code, STALE_LIFECYCLE_DECISION);
+        assert_eq!(
+            stale.diagnostics[0].path_utf8.as_deref(),
+            Some("/home/tester/.agents/skills/example/SKILL.md")
+        );
+        assert!(stale.diagnostics[0].remediation.is_some());
+        assert_eq!(
+            TransactionError::StaleLifecycleDecision(PathBuf::from("/tmp/asset")).exit_code(),
+            CONFLICT_EXIT_CODE
+        );
 
         let missing = environment_error("status", &ResolveError::MissingHome);
         assert!(missing.diagnostics[0].path_utf8.is_none());

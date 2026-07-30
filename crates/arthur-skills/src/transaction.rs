@@ -18,6 +18,7 @@ use rustix::fs::{AtFlags, Mode, OFlags, RawMode, RenameFlags};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use crate::output::CONFLICT_EXIT_CODE;
 use crate::platform::{
     effective_directory_mode, effective_file_mode, metadata_device as platform_metadata_device,
     metadata_inode as platform_metadata_inode, metadata_mode as platform_metadata_mode,
@@ -30,6 +31,9 @@ pub const TRANSACTION_SCHEMA_VERSION: u16 = 1;
 pub const TRANSACTION_EXIT_CODE: u8 = 5;
 pub const SIGINT_EXIT_CODE: u8 = 130;
 pub const SIGTERM_EXIT_CODE: u8 = 143;
+
+/// Stable diagnostic code for a decision whose preconditions no longer hold.
+pub const STALE_LIFECYCLE_DECISION: &str = "stale_lifecycle_decision";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +65,105 @@ pub struct FileIdentityProof {
     pub mtime_seconds: i64,
     pub mtime_nanoseconds: i64,
     pub sha256: String,
+}
+
+/// The fingerprint a claimed destination must still show to enter the receipt.
+///
+/// It carries exactly the dimensions the receipt itself records, so a claim is
+/// always compared against the proof it is about to publish and never against
+/// its mere presence on disk.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimFingerprint {
+    pub kind: PathKind,
+    pub sha256: Option<String>,
+    pub mode: Option<u32>,
+    pub link_target: Option<PathBuf>,
+}
+
+impl ClaimFingerprint {
+    fn matches(&self, observed: &PathSnapshot) -> bool {
+        observed.kind == self.kind
+            && observed.sha256 == self.sha256
+            && observed.mode == self.mode
+            && observed.link_target == self.link_target
+    }
+}
+
+/// One destination the projected receipt claims without writing its content.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimCheck {
+    pub destination: PathBuf,
+    pub expected: ClaimFingerprint,
+}
+
+/// Every ownership claim a transaction commits without mutating its content.
+///
+/// The plan is built before the transaction lock exists, and the lock itself is
+/// advisory: a writer that ignores it stays free to change any destination
+/// ([flock(2)](https://man7.org/linux/man-pages/man2/flock.2.html)). Each claim
+/// is therefore revalidated under the lock before the first mutation and again
+/// immediately before the receipt commit.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClaimGuard {
+    claims: Vec<ClaimCheck>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaimPhase {
+    BeforeFirstMutation,
+    BeforeReceiptCommit,
+}
+
+impl ClaimPhase {
+    fn stale(self, destination: &Path) -> TransactionError {
+        match self {
+            Self::BeforeFirstMutation => {
+                TransactionError::StaleLifecycleDecision(destination.to_path_buf())
+            }
+            Self::BeforeReceiptCommit => {
+                TransactionError::ClaimChangedDuringCommit(destination.to_path_buf())
+            }
+        }
+    }
+
+    /// A destination that became an unsupported node, or that moved while it
+    /// was being inspected, changed just as much as one whose bytes changed, so
+    /// all three fail as a stale claim rather than as an inspection error.
+    fn observe(self, destination: &Path) -> Result<PathSnapshot, TransactionError> {
+        match snapshot_path(destination) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(
+                TransactionError::UnexpectedPathType(path)
+                | TransactionError::ConcurrentFilesystemChange(path),
+            ) => Err(self.stale(&path)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl ClaimGuard {
+    #[must_use]
+    pub fn new(mut claims: Vec<ClaimCheck>) -> Self {
+        claims.sort_by(|left, right| left.destination.cmp(&right.destination));
+        Self { claims }
+    }
+
+    #[must_use]
+    pub fn claims(&self) -> &[ClaimCheck] {
+        &self.claims
+    }
+
+    fn verify(&self, phase: ClaimPhase) -> Result<(), TransactionError> {
+        for claim in &self.claims {
+            let observed = phase.observe(&claim.destination)?;
+            if !claim.expected.matches(&observed) {
+                return Err(phase.stale(&claim.destination));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PathSnapshot {
@@ -760,6 +863,10 @@ pub enum TransactionError {
     ConcurrentFilesystemChange(PathBuf),
     InvalidOperation(String, &'static str),
     DuplicateOperation(String),
+    /// A precondition or claim changed before the transaction mutated anything.
+    StaleLifecycleDecision(PathBuf),
+    /// A claimed destination changed after a mutation and before the receipt.
+    ClaimChangedDuringCommit(PathBuf),
     PreconditionsChanged {
         operation_id: String,
         expected: Box<PathSnapshot>,
@@ -789,6 +896,9 @@ impl TransactionError {
     pub const fn exit_code(&self) -> u8 {
         match self {
             Self::Interrupted(code) => *code,
+            // Nothing was mutated: the caller must review a new plan, which is
+            // the documented conflict outcome and not a transaction failure.
+            Self::StaleLifecycleDecision(_) => CONFLICT_EXIT_CODE,
             _ => TRANSACTION_EXIT_CODE,
         }
     }
@@ -833,6 +943,16 @@ impl fmt::Display for TransactionError {
             }
             Self::DuplicateOperation(id) => {
                 write!(formatter, "operation identifier is duplicated: {id}")
+            }
+            Self::StaleLifecycleDecision(path) => {
+                write!(
+                    formatter,
+                    "asset changed after planning: {}",
+                    path.display()
+                )
+            }
+            Self::ClaimChangedDuringCommit(path) => {
+                write!(formatter, "asset changed during commit: {}", path.display())
             }
             Self::PreconditionsChanged { operation_id, .. } => {
                 write!(
@@ -904,14 +1024,16 @@ impl TransactionEngine {
         &self,
         transaction_id: impl Into<String>,
         operations: Vec<Operation>,
+        claims: &ClaimGuard,
     ) -> Result<TransactionOutcome, TransactionError> {
-        self.apply_with(transaction_id, operations, &mut NoFailures)
+        self.apply_with(transaction_id, operations, claims, &mut NoFailures)
     }
 
     pub fn apply_with(
         &self,
         transaction_id: impl Into<String>,
         mut operations: Vec<Operation>,
+        claims: &ClaimGuard,
         injector: &mut dyn FailureInjector,
     ) -> Result<TransactionOutcome, TransactionError> {
         let transaction_id = transaction_id.into();
@@ -922,11 +1044,14 @@ impl TransactionEngine {
             return Err(TransactionError::RecoveryRequired);
         }
         validate_and_sort(&mut operations)?;
+        // The plan was built before this lock existed, so every precondition and
+        // every claim is revalidated here, while nothing has been mutated yet.
+        preflight(&operations, claims)?;
         let mut mutation_ordinal = 0;
         let mut journal =
             self.prepare(transaction_id, operations, injector, &mut mutation_ordinal)?;
 
-        let result = self.apply_journal(&mut journal, injector, &mut mutation_ordinal);
+        let result = self.apply_journal(&mut journal, claims, injector, &mut mutation_ordinal);
         if let Err(error) = result {
             if journal.state != JournalState::Committed
                 && self
@@ -1188,6 +1313,7 @@ impl TransactionEngine {
     fn apply_journal(
         &self,
         journal: &mut Journal,
+        claims: &ClaimGuard,
         injector: &mut dyn FailureInjector,
         mutation_ordinal: &mut usize,
     ) -> Result<(), TransactionError> {
@@ -1197,6 +1323,9 @@ impl TransactionEngine {
             .position(|entry| entry.operation.kind == OperationKind::WriteReceipt);
         for index in 0..journal.operations.len() {
             if Some(index) == receipt_index {
+                // Last chance to refuse a claim: after this operation the
+                // receipt publishes every fingerprint it carries.
+                revalidate_before_receipt(journal, claims)?;
                 journal.state = JournalState::Committing;
             } else {
                 journal.state = JournalState::Applying;
@@ -1368,6 +1497,55 @@ impl TransactionEngine {
         }
         Ok(())
     }
+}
+
+/// Revalidates every precondition and claim before the first mutation.
+///
+/// A check performed while the plan was built proves nothing about the state
+/// the mutations will meet, so the authoritative check happens here, after the
+/// lock is held and before anything is staged
+/// ([CWE-367](https://cwe.mitre.org/data/definitions/367.html)).
+fn preflight(operations: &[Operation], claims: &ClaimGuard) -> Result<(), TransactionError> {
+    for operation in operations {
+        validate_operation_destination(operation)?;
+        let observed = ClaimPhase::BeforeFirstMutation.observe(&operation.destination)?;
+        if observed != operation.precondition {
+            return Err(TransactionError::StaleLifecycleDecision(
+                operation.destination.clone(),
+            ));
+        }
+        if let Some(proof) = &operation.revalidation
+            && revalidate_file_identity(&operation.destination, proof).is_err()
+        {
+            return Err(TransactionError::StaleLifecycleDecision(
+                operation.destination.clone(),
+            ));
+        }
+    }
+    claims.verify(ClaimPhase::BeforeFirstMutation)
+}
+
+/// Revalidates every fingerprint the receipt is about to publish.
+///
+/// A mutated destination is compared against the snapshot its own operation
+/// produced, never against the pre-transaction state, and an untouched claim is
+/// compared against the proof the receipt records for it.
+fn revalidate_before_receipt(
+    journal: &Journal,
+    claims: &ClaimGuard,
+) -> Result<(), TransactionError> {
+    for entry in &journal.operations {
+        let Some(applied) = &entry.applied_snapshot else {
+            continue;
+        };
+        let observed = ClaimPhase::BeforeReceiptCommit.observe(&entry.operation.destination)?;
+        if !snapshot_matches_expected(&observed, applied) {
+            return Err(TransactionError::ClaimChangedDuringCommit(
+                entry.operation.destination.clone(),
+            ));
+        }
+    }
+    claims.verify(ClaimPhase::BeforeReceiptCommit)
 }
 
 fn validate_and_sort(operations: &mut [Operation]) -> Result<(), TransactionError> {
@@ -2598,13 +2776,13 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FailAfterMutation, FailureInjector, Inverse, JournalState, MutationPoint,
-        MutationPrimitive, NoFailures, Operation, OperationKind, OperationPayload, OperationState,
-        OwnershipProof, PathSnapshot, RootSpec, SIGINT, SIGINT_EXIT_CODE, SIGTERM,
-        SIGTERM_EXIT_CODE, SignalFlags, TransactionEngine, TransactionError, TransactionLock,
-        TransactionOutcome, apply_operation, ensure_private_directory, metadata_device,
-        path_exists, receipt_is_committed, snapshot_path, validate_and_sort,
-        validate_journal_paths,
+        ClaimCheck, ClaimFingerprint, ClaimGuard, FailAfterMutation, FailureInjector, Inverse,
+        JournalState, MutationPoint, MutationPrimitive, NoFailures, Operation, OperationKind,
+        OperationPayload, OperationState, OwnershipProof, PathSnapshot, RootSpec, SIGINT,
+        SIGINT_EXIT_CODE, SIGTERM, SIGTERM_EXIT_CODE, SignalFlags, TRANSACTION_EXIT_CODE,
+        TransactionEngine, TransactionError, TransactionLock, TransactionOutcome, apply_operation,
+        ensure_private_directory, metadata_device, path_exists, receipt_is_committed,
+        snapshot_path, validate_and_sort, validate_journal_paths,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -2790,7 +2968,7 @@ mod tests {
         ];
 
         assert_eq!(
-            engine.apply("nominal", operations)?,
+            engine.apply("nominal", operations, &ClaimGuard::default())?,
             TransactionOutcome::Committed
         );
         assert_eq!(fs::read(first.path.join("asset.txt"))?, b"first");
@@ -2850,7 +3028,12 @@ mod tests {
 
             assert!(
                 engine
-                    .apply_with(format!("failure-{target}"), operations, &mut injector)
+                    .apply_with(
+                        format!("failure-{target}"),
+                        operations,
+                        &ClaimGuard::default(),
+                        &mut injector
+                    )
                     .is_err()
             );
             assert_eq!(snapshot_path(&destination)?, before);
@@ -2862,6 +3045,177 @@ mod tests {
             let stage_name = format!(".arthur-workflow-failure-{target}-managed.stage");
             assert!(!directory.path().join(stage_name).exists());
         }
+        Ok(())
+    }
+
+    /// A writer that ignores the advisory transaction lock, as flock(2) allows.
+    struct ChangeAfterInstall {
+        operation_id: &'static str,
+        target: PathBuf,
+        bytes: &'static [u8],
+    }
+
+    impl FailureInjector for ChangeAfterInstall {
+        fn after_mutation(&mut self, point: &MutationPoint) -> Result<(), String> {
+            if point.primitive == MutationPrimitive::InstallNoReplace
+                && point.operation_id.as_deref() == Some(self.operation_id)
+            {
+                fs::write(&self.target, self.bytes).map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+    }
+
+    fn claim_for(destination: &Path) -> Result<ClaimGuard, TransactionError> {
+        let snapshot = snapshot_path(destination)?;
+        Ok(ClaimGuard::new(vec![ClaimCheck {
+            destination: destination.to_path_buf(),
+            expected: ClaimFingerprint {
+                kind: snapshot.kind,
+                sha256: snapshot.sha256,
+                mode: snapshot.mode,
+                link_target: snapshot.link_target,
+            },
+        }]))
+    }
+
+    #[test]
+    fn a_claim_changed_before_the_first_mutation_blocks_without_mutating() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let managed = root(&directory, "managed")?;
+        let claimed = managed.path.join("claimed.txt");
+        fs::write(&claimed, b"proven")?;
+        let claims = claim_for(&claimed)?;
+        let operations = vec![
+            create_file("asset", &managed, "asset.txt", b"installed")?,
+            receipt(&managed, br#"{"state":"committed"}"#)?,
+        ];
+
+        // The claim is only proven by the receipt, so nothing would rewrite it.
+        fs::write(&claimed, b"foreign")?;
+        let engine = engine(&directory);
+        let error = engine
+            .apply("stale-claim", operations, &claims)
+            .err()
+            .ok_or("a stale claim must refuse the transaction")?;
+        assert!(
+            matches!(&error, TransactionError::StaleLifecycleDecision(path) if *path == claimed)
+        );
+        assert_eq!(error.exit_code(), 3);
+        assert!(!managed.path.join("asset.txt").exists());
+        assert!(!managed.path.join("receipt.json").exists());
+        assert_eq!(engine.journal_state()?, None);
+        assert!(
+            !directory
+                .path()
+                .join(".arthur-workflow-stale-claim-managed.stage")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_precondition_changed_before_the_first_mutation_blocks_without_mutating() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let managed = root(&directory, "managed")?;
+        let destination = managed.path.join("asset.txt");
+        let operations = vec![
+            create_file("asset", &managed, "asset.txt", b"installed")?,
+            receipt(&managed, br#"{"state":"committed"}"#)?,
+        ];
+
+        // The destination was absent when the plan was built.
+        fs::write(&destination, b"foreign")?;
+        let engine = engine(&directory);
+        let error = engine
+            .apply("stale-precondition", operations, &ClaimGuard::default())
+            .err()
+            .ok_or("a stale precondition must refuse the transaction")?;
+        assert!(
+            matches!(&error, TransactionError::StaleLifecycleDecision(path) if *path == destination)
+        );
+        assert_eq!(error.exit_code(), 3);
+        assert_eq!(fs::read(&destination)?, b"foreign");
+        assert!(!managed.path.join("receipt.json").exists());
+        assert_eq!(engine.journal_state()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_claim_changed_during_the_transaction_rolls_back_before_the_receipt() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let managed = root(&directory, "managed")?;
+        let claimed = managed.path.join("claimed.txt");
+        fs::write(&claimed, b"proven")?;
+        let claims = claim_for(&claimed)?;
+        let operations = vec![
+            create_file("asset", &managed, "asset.txt", b"installed")?,
+            receipt(&managed, br#"{"state":"committed"}"#)?,
+        ];
+        let mut injector = ChangeAfterInstall {
+            operation_id: "asset",
+            target: claimed.clone(),
+            bytes: b"foreign",
+        };
+
+        let engine = engine(&directory);
+        let error = engine
+            .apply_with("racing-claim", operations, &claims, &mut injector)
+            .err()
+            .ok_or("a claim changed during the transaction must not be committed")?;
+        assert!(
+            matches!(&error, TransactionError::ClaimChangedDuringCommit(path) if *path == claimed)
+        );
+        assert_eq!(error.exit_code(), TRANSACTION_EXIT_CODE);
+        assert!(
+            !managed.path.join("asset.txt").exists(),
+            "rollback is complete"
+        );
+        assert!(!managed.path.join("receipt.json").exists());
+        assert_eq!(fs::read(&claimed)?, b"foreign");
+        assert_eq!(engine.journal_state()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_created_asset_is_revalidated_against_its_applied_snapshot() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let managed = root(&directory, "managed")?;
+        let first = managed.path.join("first.txt");
+        let operations = vec![
+            create_file("asset-a", &managed, "first.txt", b"installed")?,
+            create_file("asset-b", &managed, "second.txt", b"installed")?,
+            receipt(&managed, br#"{"state":"committed"}"#)?,
+        ];
+        // The first asset is already applied and verified when the second one
+        // installs, so only the pre-commit revalidation can still see it change.
+        let mut injector = ChangeAfterInstall {
+            operation_id: "asset-b",
+            target: first.clone(),
+            bytes: b"tampered",
+        };
+
+        let engine = engine(&directory);
+        let error = engine
+            .apply_with(
+                "racing-created",
+                operations,
+                &ClaimGuard::default(),
+                &mut injector,
+            )
+            .err()
+            .ok_or("a tampered asset must not reach the receipt")?;
+        // Compensation cannot recognise the tampered node, so the journal and
+        // its backups are preserved for `recover` instead of being discarded.
+        assert!(matches!(error, TransactionError::RecoveryRequired));
+        assert_eq!(error.exit_code(), TRANSACTION_EXIT_CODE);
+        assert!(!managed.path.join("receipt.json").exists());
+        assert_eq!(
+            engine.journal_state()?,
+            Some(JournalState::RecoveryRequired)
+        );
+        assert!(!managed.path.join("second.txt").exists());
+        assert_eq!(fs::read(&first)?, b"tampered");
         Ok(())
     }
 
@@ -2962,7 +3316,12 @@ mod tests {
             seen: 0,
             marker: base.join("pause-ready"),
         };
-        let _ = engine.apply_with(format!("sigkill-{target}"), operations, &mut injector);
+        let _ = engine.apply_with(
+            format!("sigkill-{target}"),
+            operations,
+            &ClaimGuard::default(),
+            &mut injector,
+        );
         Err("SIGKILL fixture reached the end without pausing".into())
     }
 
@@ -3020,6 +3379,7 @@ mod tests {
                         )?,
                         receipt(&managed, br#"{"state":"contender"}"#)?,
                     ],
+                    &ClaimGuard::default(),
                 );
                 assert!(matches!(contender, Err(TransactionError::LockBusy)));
                 assert_eq!(snapshot_path(&destination)?, before);
@@ -3099,6 +3459,7 @@ mod tests {
                 replace_file("replace", &managed, "asset.txt", before.clone(), b"after")?,
                 receipt(&managed, br#"{"state":"committed"}"#)?,
             ],
+            &ClaimGuard::default(),
             &mut injector,
         );
         assert!(matches!(result, Err(TransactionError::InjectedFailure(_))));
@@ -3226,7 +3587,12 @@ mod tests {
             destination: destination.clone(),
             fired: false,
         };
-        let result = engine(&directory).apply_with("race", operations, &mut injector);
+        let result = engine(&directory).apply_with(
+            "race",
+            operations,
+            &ClaimGuard::default(),
+            &mut injector,
+        );
 
         assert!(matches!(
             result,
@@ -3387,7 +3753,12 @@ mod tests {
         let mut injector = FailAfterMutation::new(2);
         assert!(
             engine(&directory)
-                .apply_with("prepare-failure", operations, &mut injector)
+                .apply_with(
+                    "prepare-failure",
+                    operations,
+                    &ClaimGuard::default(),
+                    &mut injector
+                )
                 .is_err()
         );
         assert!(
@@ -3445,7 +3816,7 @@ mod tests {
         ];
 
         assert_eq!(
-            engine(&directory).apply("all-kinds", operations)?,
+            engine(&directory).apply("all-kinds", operations, &ClaimGuard::default())?,
             TransactionOutcome::Committed
         );
         assert!(created_directory.is_dir());
@@ -3518,7 +3889,12 @@ mod tests {
 
         assert!(
             engine(&directory)
-                .apply_with("rollback-created", operations, &mut injector)
+                .apply_with(
+                    "rollback-created",
+                    operations,
+                    &ClaimGuard::default(),
+                    &mut injector
+                )
                 .is_err()
         );
         assert!(!created.exists());
@@ -3548,7 +3924,12 @@ mod tests {
 
         assert!(
             engine(&directory)
-                .apply_with("rollback-existing", operations, &mut injector)
+                .apply_with(
+                    "rollback-existing",
+                    operations,
+                    &ClaimGuard::default(),
+                    &mut injector
+                )
                 .is_err()
         );
         assert_eq!(
@@ -3819,6 +4200,7 @@ mod tests {
             engine(&directory).apply(
                 "rewrite-lock",
                 vec![rewrite, receipt(&managed, br#"{"state":"adopted"}"#)?],
+                &ClaimGuard::default()
             )?,
             TransactionOutcome::Committed
         );
@@ -3890,6 +4272,7 @@ mod tests {
         let result = engine(&directory).apply(
             "nonempty-directory",
             vec![operation, receipt(&managed, br#"{"state":"remove"}"#)?],
+            &ClaimGuard::default(),
         );
         assert!(matches!(
             result,
@@ -3912,6 +4295,7 @@ mod tests {
                 create_file("asset", &managed, "asset.txt", b"installed")?,
                 receipt(&managed, br#"{"state":"signal"}"#)?,
             ],
+            &ClaimGuard::default(),
         );
         assert!(matches!(
             result,
@@ -3971,6 +4355,7 @@ mod tests {
                     create_file("asset", &wrong_device, "asset.txt", b"asset")?,
                     receipt(&wrong_device, br#"{"state":"device"}"#)?,
                 ],
+                &ClaimGuard::default()
             ),
             Err(TransactionError::DeviceMismatch { .. })
         ));
@@ -3984,6 +4369,7 @@ mod tests {
                     create_file("asset", &wrong_real, "asset.txt", b"asset")?,
                     receipt(&wrong_real, br#"{"state":"real"}"#)?,
                 ],
+                &ClaimGuard::default()
             ),
             Err(TransactionError::RootIdentityChanged { .. })
         ));
@@ -4218,6 +4604,7 @@ mod tests {
                     create_file("other", &managed, "other.txt", b"other")?,
                     receipt(&managed, b"new")?,
                 ],
+                &ClaimGuard::default()
             ),
             Err(TransactionError::RecoveryRequired)
         ));

@@ -53,9 +53,10 @@ fn apply(
     decision: &LifecycleDecision,
     transaction_id: &str,
 ) -> Result<TransactionOutcome, Box<dyn Error>> {
-    let operations = operations_for_plan(&decision.plan, roots, &decision.receipt, transaction_id)?;
+    let transaction =
+        operations_for_plan(&decision.plan, roots, &decision.receipt, transaction_id)?;
     let engine = TransactionEngine::new(roots.state_directory.clone(), SignalFlags::default());
-    Ok(engine.apply(transaction_id, operations)?)
+    Ok(engine.apply(transaction_id, transaction.operations, &transaction.claims)?)
 }
 
 /// Installs the whole catalog and returns the committed receipt.
@@ -553,7 +554,9 @@ fn a_stale_receipt_converges_through_a_visible_receipt_only_operation() -> TestR
     );
     assert!(again.plan.operations.is_empty());
     assert!(
-        operations_for_plan(&again.plan, &roots, &again.receipt, "second-run")?.is_empty(),
+        operations_for_plan(&again.plan, &roots, &again.receipt, "second-run")?
+            .operations
+            .is_empty(),
         "a semantically current receipt is never rewritten"
     );
     Ok(())
@@ -736,7 +739,7 @@ fn a_residual_lock_cleanup_plans_its_own_receipt_commit() -> TestResult {
         "a receipt-proven destination is never adoptable"
     );
 
-    let operations = arthur_skills::operations::operations_for_import(
+    let transaction = arthur_skills::operations::operations_for_import(
         &decision.plan,
         &roots.legacy_lock_path,
         Some(&legacy),
@@ -745,14 +748,19 @@ fn a_residual_lock_cleanup_plans_its_own_receipt_commit() -> TestResult {
         "residual-cleanup",
     )?;
     assert_eq!(
-        operations
+        transaction
+            .operations
             .iter()
             .filter(|operation| operation.destination == roots.receipt_path)
             .count(),
         1,
         "every transaction commits exactly one receipt"
     );
-    assert_eq!(operations.len(), 3, "archive, lock rewrite and receipt");
+    assert_eq!(
+        transaction.operations.len(),
+        3,
+        "archive, lock rewrite and receipt"
+    );
     Ok(())
 }
 
@@ -841,14 +849,14 @@ fn a_failed_receipt_commit_rolls_back_without_announcing_success() -> TestResult
         &LegacyEvidence::Absent,
     )?;
     assert!(decision.receipt_change.required);
-    let operations = operations_for_plan(
+    let transaction = operations_for_plan(
         &decision.plan,
         &roots,
         &decision.receipt,
         "failed-receipt-commit",
     )?;
     assert_eq!(
-        operations.len(),
+        transaction.operations.len(),
         1,
         "a receipt-only decision plans exactly one operation"
     );
@@ -858,7 +866,12 @@ fn a_failed_receipt_commit_rolls_back_without_announcing_success() -> TestResult
     let mut injector = FailAfterMutation::new(1);
     assert!(
         engine
-            .apply_with("failed-receipt-commit", operations, &mut injector)
+            .apply_with(
+                "failed-receipt-commit",
+                transaction.operations,
+                &transaction.claims,
+                &mut injector,
+            )
             .is_err()
     );
     assert_eq!(fs::read(&roots.receipt_path)?, before_receipt);

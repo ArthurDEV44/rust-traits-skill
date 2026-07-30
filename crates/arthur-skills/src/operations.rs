@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -10,9 +11,56 @@ use crate::platform::effective_file_mode;
 use crate::provider::{ResolvedRoots, RootIdentity};
 use crate::receipt::{OwnedAsset, OwnedAssetKind, Receipt, ReceiptState};
 use crate::transaction::{
-    FileIdentityProof, Inverse, Operation, OperationKind, OperationPayload, OwnershipProof,
-    PathKind, PathSnapshot, RootSpec, TransactionError, snapshot_path,
+    ClaimCheck, ClaimFingerprint, ClaimGuard, FileIdentityProof, Inverse, Operation, OperationKind,
+    OperationPayload, OwnershipProof, PathKind, PathSnapshot, RootSpec, TransactionError,
+    snapshot_path,
 };
+
+/// What a decision hands to the executor: its mutations and the claims it must
+/// revalidate because no mutation proves them.
+#[derive(Debug)]
+pub struct TransactionPlan {
+    pub operations: Vec<Operation>,
+    pub claims: ClaimGuard,
+}
+
+impl TransactionPlan {
+    fn new(operations: Vec<Operation>, receipt: &Receipt) -> Self {
+        let claims = claims_for(receipt, &operations);
+        Self { operations, claims }
+    }
+}
+
+/// Collects every destination the projected receipt claims without writing it.
+///
+/// A destination this transaction mutates is proven by its own operation and its
+/// applied snapshot, so only the untouched claims need a separate revalidation.
+fn claims_for(receipt: &Receipt, operations: &[Operation]) -> ClaimGuard {
+    let mutated = operations
+        .iter()
+        .map(|operation| operation.destination.as_path())
+        .collect::<BTreeSet<_>>();
+    ClaimGuard::new(
+        receipt
+            .assets
+            .iter()
+            .filter(|asset| !mutated.contains(asset.destination.as_path()))
+            .map(|asset| ClaimCheck {
+                destination: asset.destination.clone(),
+                expected: ClaimFingerprint {
+                    kind: match asset.kind {
+                        OwnedAssetKind::File => PathKind::File,
+                        OwnedAssetKind::Directory => PathKind::Directory,
+                        OwnedAssetKind::Symlink => PathKind::Symlink,
+                    },
+                    sha256: asset.hash.clone(),
+                    mode: asset.mode,
+                    link_target: asset.link_target.clone(),
+                },
+            })
+            .collect(),
+    )
+}
 
 #[derive(Debug)]
 pub enum OperationBuildError {
@@ -85,7 +133,7 @@ pub fn operations_for_plan(
     roots: &ResolvedRoots,
     next_receipt: &Receipt,
     transaction_id: &str,
-) -> Result<Vec<Operation>, OperationBuildError> {
+) -> Result<TransactionPlan, OperationBuildError> {
     if !plan.applicable {
         return Err(OperationBuildError::PlanBlocked);
     }
@@ -96,7 +144,7 @@ pub fn operations_for_plan(
     if plans_receipt_commit(plan) {
         operations.push(receipt_operation(roots, next_receipt, transaction_id)?);
     }
-    Ok(operations)
+    Ok(TransactionPlan::new(operations, next_receipt))
 }
 
 /// True when the decision planned the receipt commit itself.
@@ -125,7 +173,7 @@ pub fn operations_for_adoption(
     roots: &ResolvedRoots,
     next_receipt: &Receipt,
     transaction_id: &str,
-) -> Result<Vec<Operation>, OperationBuildError> {
+) -> Result<TransactionPlan, OperationBuildError> {
     if !adoption.applicable {
         return Err(OperationBuildError::AdoptionBlocked);
     }
@@ -140,7 +188,7 @@ pub fn operations_for_adoption(
         roots,
     )?;
     operations.push(receipt_operation(roots, next_receipt, transaction_id)?);
-    Ok(operations)
+    Ok(TransactionPlan::new(operations, next_receipt))
 }
 
 pub fn operations_for_import(
@@ -150,7 +198,7 @@ pub fn operations_for_import(
     roots: &ResolvedRoots,
     next_receipt: &Receipt,
     transaction_id: &str,
-) -> Result<Vec<Operation>, OperationBuildError> {
+) -> Result<TransactionPlan, OperationBuildError> {
     if !plan.applicable {
         return Err(OperationBuildError::PlanBlocked);
     }
@@ -182,7 +230,7 @@ pub fn operations_for_import(
     if plans_receipt_commit(plan) {
         operations.push(receipt_operation(roots, next_receipt, transaction_id)?);
     }
-    Ok(operations)
+    Ok(TransactionPlan::new(operations, next_receipt))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1203,13 +1251,13 @@ mod tests {
         let operations = operations_for_plan(&plan, &roots, &previous, "new-tx")
             .unwrap_or_else(|error| panic!("receipt operation failed: {error}"));
 
-        assert_eq!(operations.len(), 1);
+        assert_eq!(operations.operations.len(), 1);
         assert!(matches!(
-            operations[0].inverse,
+            operations.operations[0].inverse,
             Inverse::RestoreBackup { .. }
         ));
         assert!(matches!(
-            operations[0].ownership,
+            operations.operations[0].ownership,
             OwnershipProof::Receipt { .. }
         ));
     }
@@ -1245,9 +1293,9 @@ mod tests {
             .unwrap_or_else(|error| panic!("receipt convergence failed: {error}"));
         let operations = operations_for_plan(&plan, &roots, &receipt, "tx-1")
             .unwrap_or_else(|error| panic!("operation build failed: {error}"));
-        assert_eq!(operations.len(), 2);
-        assert_eq!(operations[1].kind, OperationKind::WriteReceipt);
-        assert_eq!(operations[1].expected_after.mode, Some(0o600));
+        assert_eq!(operations.operations.len(), 2);
+        assert_eq!(operations.operations[1].kind, OperationKind::WriteReceipt);
+        assert_eq!(operations.operations[1].expected_after.mode, Some(0o600));
     }
 
     #[test]
@@ -1317,9 +1365,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("receipt build failed: {error}"));
         let operations = operations_for_adoption(&lock_path, &adoption, &roots, &next, "tx-2")
             .unwrap_or_else(|error| panic!("operation build failed: {error}"));
-        assert_eq!(operations.len(), 3);
-        assert_eq!(operations[1].kind, OperationKind::RewriteLegacyLock);
-        assert!(operations[1].revalidation.is_some());
+        assert_eq!(operations.operations.len(), 3);
+        assert_eq!(
+            operations.operations[1].kind,
+            OperationKind::RewriteLegacyLock
+        );
+        assert!(operations.operations[1].revalidation.is_some());
         assert_eq!(
             fs::read(&lock_path).ok().as_deref(),
             Some(b"legacy".as_slice())
