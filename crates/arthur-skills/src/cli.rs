@@ -39,7 +39,8 @@ pub enum Command {
     Update(ConfirmationArgs),
     /// Remove one provider integration, or all managed integrations.
     Uninstall(UninstallArgs),
-    /// Adopt compatible entries from a Vercel Skills v3 installation.
+    /// Transfer the skills a verified Vercel Skills v3 lock entry proves.
+    /// A matching path without such proof stays foreign: move or remove it, then run plan again.
     Adopt(MutationArgs),
     /// Resume rollback or cleanup from the durable transaction journal.
     Recover,
