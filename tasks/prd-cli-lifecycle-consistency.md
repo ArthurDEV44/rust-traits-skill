@@ -7,6 +7,7 @@
 |---------|------|--------|---------|
 | 1.0 | 2026-07-30 | Arthur Jean | Correctif du contrat de provenance, de planification, d'adoption et de convergence du receipt |
 | 1.1 | 2026-07-30 | Arthur Jean | EP-002: précision de la classification d'un chemin absent et du receipt commit lié à une réécriture de lock vérifié |
+| 1.2 | 2026-07-30 | Arthur Jean | EP-003: unification du résultat périmé sur `stale_lifecycle_decision` et extension de la revalidation à toute claim déjà possédée |
 
 ## Problem Statement
 
@@ -265,6 +266,12 @@ Construire une décision de cycle de vie canonique et la faire consommer sans di
 Fermer la fenêtre entre confirmation et receipt commit, puis prouver le comportement sur les états mixtes qui ont révélé le défaut.
 
 **Definition of Done:** aucune claim périmée ne peut entrer dans un receipt; les fixtures couvrent provenance partielle, receipt périmé, renderers et changements concurrents sur les cinq surfaces de décision.
+
+**Amendements constatés pendant l'implémentation (v1.2):**
+
+- Toute précondition périmée détectée avant la première mutation produit désormais `stale_lifecycle_decision`, statut `blocked` et code 3, y compris le chemin qui retournait auparavant un échec de transaction en code 5 lors de la construction des opérations. FR-17 prévaut sur la classification historique de `StalePlan`: aucune écriture n'a eu lieu, donc le résultat est un conflit et non une transaction échouée.
+- La revalidation ne se limite pas aux assets nouvellement revendiqués: toute entrée du receipt projeté que la transaction n'écrit pas est revérifiée, y compris une entrée déjà possédée. Une transaction dont le receipt republierait la preuve d'un asset dérivé est donc refusée avec son chemin exact. Cela concrétise FR-16 et la mitigation du risque 1.
+- La revalidation compare toujours le contenu recalculé, jamais un couple mtime/taille: une modification survenue dans la même granularité d'horodatage resterait invisible autrement ([racy Git](https://git-scm.com/docs/racy-git)).
 
 #### US-008: Revalider chaque claim avant le receipt commit
 
