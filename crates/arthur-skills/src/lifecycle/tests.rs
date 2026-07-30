@@ -243,6 +243,7 @@ fn transition_requires_every_managed_root_and_preserves_historical_roots() -> Te
             &claude,
             Some(&current),
             &LifecycleIntent::UninstallProvider(ProviderId::Claude),
+            None,
         ),
         Err(LifecycleError::MissingProviderRoot(ProviderId::Codex))
     ));
@@ -252,6 +253,7 @@ fn transition_requires_every_managed_root_and_preserves_historical_roots() -> Te
             &claude,
             None,
             &LifecycleIntent::Install { providers: vec![] },
+            None,
         ),
         Err(LifecycleError::EmptyProviderSelection)
     ));
@@ -290,6 +292,7 @@ fn transition_requires_every_managed_root_and_preserves_historical_roots() -> Te
             &LifecycleIntent::Install {
                 providers: vec![ProviderId::Claude],
             },
+            None,
         ),
         Err(LifecycleError::UnsafeContainer { .. })
     ));

@@ -560,9 +560,9 @@ mod tests {
     use crate::adoption::{AdoptedEntry, AdoptionPlan, EntryType, LockIdentity};
     use crate::engine::{plan_desired_state, receipt_after_adoption};
     use crate::plan::{
-        DesiredAsset, DesiredPayload, MutationKind, NodeKind, OwnershipProof as PlanOwnership,
-        PathSnapshot as PlanSnapshot, Plan, PlanAction, PlanEntry, PlannedInverse, PlannedMutation,
-        Precondition as PlanPrecondition,
+        DesiredAsset, DesiredPayload, MutationKind, NodeKind, OwnershipClaim,
+        OwnershipProof as PlanOwnership, PathSnapshot as PlanSnapshot, Plan, PlanAction, PlanEntry,
+        PlannedInverse, PlannedMutation, Precondition as PlanPrecondition,
     };
     use crate::provider::{ProviderId, RootIdentity, resolve_roots_from};
     use crate::receipt::{OwnedAsset, OwnedAssetKind, Receipt};
@@ -693,6 +693,7 @@ mod tests {
             destination: destination.clone(),
             owner: crate::plan::Owner::Unmanaged,
             reason: String::new(),
+            ownership: OwnershipClaim::None,
         });
         let mut receipt = Receipt::new("0.1.0", "a".repeat(64), &roots);
         assert!(matches!(
@@ -780,6 +781,7 @@ mod tests {
             destination: roots.canonical_skills.join(format!("terminal-{index}")),
             owner: crate::plan::Owner::Unmanaged,
             reason: String::new(),
+            ownership: OwnershipClaim::None,
         })
         .collect();
         receipt.assets.clear();

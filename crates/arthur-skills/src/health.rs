@@ -215,6 +215,7 @@ fn inspect_catalog_coverage(
         roots,
         Some(receipt),
         &LifecycleIntent::Install { providers },
+        None,
     ) {
         Ok(transition) => transition,
         Err(error) => {

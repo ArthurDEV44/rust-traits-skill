@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use arthur_skills::app::{App, Provider, Review};
-use arthur_skills::plan::{Owner, PLAN_SCHEMA_VERSION, Plan, PlanAction, PlanEntry};
+use arthur_skills::plan::{
+    Owner, OwnershipClaim, PLAN_SCHEMA_VERSION, Plan, PlanAction, PlanEntry,
+};
 use arthur_skills::provider::resolve_roots_from;
 use arthur_skills::ui::render;
 use ratatui::Terminal;
@@ -120,6 +122,7 @@ fn review_projection_labels_unknown_roots_and_renders_applicable_plans() -> Test
             destination,
             owner: Owner::ArthurWorkflow,
             reason: "already current".to_owned(),
+            ownership: OwnershipClaim::None,
         }],
         operations: Vec::new(),
         diagnostics: Vec::new(),

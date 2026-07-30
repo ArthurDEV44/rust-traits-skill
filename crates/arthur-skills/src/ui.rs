@@ -796,7 +796,7 @@ mod tests {
     use crate::app::{Action, App, Provider, Review};
     use crate::lifecycle::{LifecycleNotice, LifecycleNoticeCode};
     use crate::output::{Envelope, OutputDiagnostic, OutputOperation, OutputSeverity};
-    use crate::plan::{Owner, Plan, PlanAction, PlanEntry};
+    use crate::plan::{Owner, OwnershipClaim, Plan, PlanAction, PlanEntry};
     use crate::provider::resolve_roots_from;
     use crate::workflow::{AssetSummary, WorkflowAssessment, WorkflowState};
 
@@ -967,6 +967,7 @@ mod tests {
                     destination: "/home/user/.agents/skills/coss/SKILL.md".into(),
                     owner: Owner::ArthurWorkflow,
                     reason: "managed path needs an update".to_owned(),
+                    ownership: OwnershipClaim::None,
                 }],
             )]
             .into_iter()
@@ -1077,6 +1078,7 @@ mod tests {
                     .join(format!("skill-{index}/SKILL.md")),
                 owner: Owner::Unmanaged,
                 reason: "foreign content".to_owned(),
+                ownership: OwnershipClaim::None,
             })
             .collect::<Vec<_>>();
         let plan = Plan {

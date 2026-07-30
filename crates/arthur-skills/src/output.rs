@@ -581,7 +581,8 @@ mod tests {
         write_human_compact, write_json,
     };
     use crate::plan::{
-        Diagnostic, DiagnosticSeverity, Owner, Plan, PlanAction, PlanEntry, PlannedMutation,
+        Diagnostic, DiagnosticSeverity, Owner, OwnershipClaim, Plan, PlanAction, PlanEntry,
+        PlannedMutation,
     };
 
     #[test]
@@ -623,6 +624,7 @@ mod tests {
                 destination: non_utf8.clone(),
                 owner: Owner::Unmanaged,
                 reason: "foreign destination".to_owned(),
+                ownership: OwnershipClaim::None,
             }],
             operations: Vec::<PlannedMutation>::new(),
             diagnostics: vec![

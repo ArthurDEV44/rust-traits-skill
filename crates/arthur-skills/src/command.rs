@@ -138,6 +138,10 @@ fn run_plan(
         Ok(context) => context,
         Err(envelope) => return *envelope,
     };
+    let legacy_import = match legacy_import_plan(catalog, &roots) {
+        Ok(legacy) => legacy,
+        Err(message) => return lifecycle_error("plan", providers, message),
+    };
     match prepare_lifecycle_transition(
         catalog,
         &roots,
@@ -145,10 +149,25 @@ fn run_plan(
         &LifecycleIntent::Install {
             providers: providers.clone(),
         },
+        legacy_import.as_ref(),
     ) {
         Ok(transition) => report_transition("plan", transition),
         Err(error) => lifecycle_error("plan", providers, error.to_string()),
     }
+}
+
+/// Read-only inspection of the Vercel Skills v3 lock shared by every surface.
+fn legacy_import_plan(
+    catalog: &Catalog,
+    roots: &ResolvedRoots,
+) -> Result<Option<LegacyImportPlan>, String> {
+    let archive_path = next_legacy_archive_path(&roots.state_directory)?;
+    adoption::inspect_legacy_import(
+        &roots.legacy_lock_path,
+        &archive_path,
+        &catalog_skill_names(catalog),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn run_install(
@@ -177,6 +196,10 @@ fn run_install(
         Ok(context) => context,
         Err(envelope) => return *envelope,
     };
+    let legacy_import = match legacy_import_plan(catalog, &roots) {
+        Ok(legacy) => legacy,
+        Err(message) => return lifecycle_error("install", providers, message),
+    };
     let initial_transition = match prepare_lifecycle_transition(
         catalog,
         &roots,
@@ -184,23 +207,10 @@ fn run_install(
         &LifecycleIntent::Install {
             providers: providers.clone(),
         },
+        legacy_import.as_ref(),
     ) {
         Ok(transition) => transition,
         Err(error) => return lifecycle_error("install", providers, error.to_string()),
-    };
-    let legacy_import = {
-        let archive_path = match next_legacy_archive_path(&roots.state_directory) {
-            Ok(path) => path,
-            Err(message) => return lifecycle_error("install", providers, message),
-        };
-        match adoption::inspect_legacy_import(
-            &roots.legacy_lock_path,
-            &archive_path,
-            &catalog_skill_names(catalog),
-        ) {
-            Ok(legacy) => legacy,
-            Err(error) => return lifecycle_error("install", providers, error.to_string()),
-        }
     };
     let assessment = Some(assess(
         current.as_ref(),
@@ -322,6 +332,10 @@ fn run_update(
         }
     }
     let providers = managed_providers(&receipt);
+    let legacy_import = match legacy_import_plan(catalog, &roots) {
+        Ok(legacy) => legacy,
+        Err(message) => return lifecycle_error("update", providers, message),
+    };
     let initial_transition = match prepare_lifecycle_transition(
         catalog,
         &roots,
@@ -329,20 +343,9 @@ fn run_update(
         &LifecycleIntent::Install {
             providers: providers.clone(),
         },
+        legacy_import.as_ref(),
     ) {
         Ok(transition) => transition,
-        Err(error) => return lifecycle_error("update", providers, error.to_string()),
-    };
-    let archive_path = match next_legacy_archive_path(&roots.state_directory) {
-        Ok(path) => path,
-        Err(message) => return lifecycle_error("update", providers, message),
-    };
-    let legacy_import = match adoption::inspect_legacy_import(
-        &roots.legacy_lock_path,
-        &archive_path,
-        &catalog_skill_names(catalog),
-    ) {
-        Ok(legacy) => legacy,
         Err(error) => return lifecycle_error("update", providers, error.to_string()),
     };
     let assessment = assess(
@@ -434,11 +437,12 @@ fn run_uninstall(
         Ok(context) => context,
         Err(envelope) => return *envelope,
     };
-    let transition = match prepare_lifecycle_transition(catalog, &roots, current.as_ref(), &intent)
-    {
-        Ok(transition) => transition,
-        Err(error) => return lifecycle_error("uninstall", managed, error.to_string()),
-    };
+    // Uninstall never adopts, so it takes no legacy proof.
+    let transition =
+        match prepare_lifecycle_transition(catalog, &roots, current.as_ref(), &intent, None) {
+            Ok(transition) => transition,
+            Err(error) => return lifecycle_error("uninstall", managed, error.to_string()),
+        };
     apply_transition(
         ApplyRequest {
             catalog,
@@ -476,6 +480,10 @@ fn run_adopt(
         Ok(context) => context,
         Err(envelope) => return *envelope,
     };
+    let legacy_import = match legacy_import_plan(catalog, &roots) {
+        Ok(legacy) => legacy,
+        Err(message) => return lifecycle_error("adopt", providers, message),
+    };
     let transition = match prepare_lifecycle_transition(
         catalog,
         &roots,
@@ -483,6 +491,7 @@ fn run_adopt(
         &LifecycleIntent::Install {
             providers: providers.clone(),
         },
+        legacy_import.as_ref(),
     ) {
         Ok(transition) => transition,
         Err(error) => return lifecycle_error("adopt", providers, error.to_string()),
@@ -492,13 +501,15 @@ fn run_adopt(
         Err(message) => return lifecycle_error("adopt", providers, message),
     };
     if entries.is_empty() {
-        let mut envelope = report_transition("adopt", transition);
-        if envelope.status != OutputStatus::Blocked {
-            envelope.status = OutputStatus::Noop;
-            envelope.exit_code = 0;
-        }
+        // Only verified legacy candidates are in scope for adopt. Catalog
+        // collisions without proof belong to a reconcile request.
+        let mut envelope =
+            Envelope::new(Some("adopt")).with_plan(&adoption_scoped_plan(&transition.plan, true));
+        envelope.providers = providers;
+        envelope.status = OutputStatus::Noop;
+        envelope.exit_code = 0;
         envelope.data =
-            json!({ "adopted": 0, "message": "no matching unmanaged skill entries were found" });
+            json!({ "adopted": 0, "message": "no verified legacy skill entries were found" });
         return envelope;
     }
     let archive_path = match next_legacy_archive_path(&roots.state_directory) {
@@ -509,12 +520,7 @@ fn run_adopt(
         Ok(adoption) => adoption,
         Err(error) => return lifecycle_error("adopt", providers, error.to_string()),
     };
-    let mut adoption_plan = transition.plan.clone();
-    adoption_plan
-        .entries
-        .retain(|entry| entry.action == plan::PlanAction::Adoptable);
-    adoption_plan.operations.clear();
-    adoption_plan.applicable = adoption.applicable;
+    let adoption_plan = adoption_scoped_plan(&transition.plan, adoption.applicable);
     let mut envelope = Envelope::new(Some("adopt")).with_plan(&adoption_plan);
     envelope.providers.clone_from(&providers);
     if adoption.applicable {
@@ -527,10 +533,14 @@ fn run_adopt(
                 .destination
                 .as_deref()
                 .map_or((None, None), path_fields);
+            let message = diagnostic.source_id.as_ref().map_or_else(
+                || diagnostic.detail.clone(),
+                |source_id| format!("{source_id}: {}", diagnostic.detail),
+            );
             OutputDiagnostic {
                 code: format!("{:?}", diagnostic.code).to_ascii_lowercase(),
                 severity: OutputSeverity::Error,
-                message: diagnostic.detail.clone(),
+                message,
                 path_utf8,
                 path_bytes_hex,
                 remediation: Some(
@@ -961,6 +971,40 @@ fn providers_or_interactive(
     }
 }
 
+/// Restricts a reconcile plan to the verified legacy candidates `adopt` owns.
+///
+/// Unproven catalog collisions are evaluated by a reconcile request, so they
+/// must not turn `adopt` into a blocked command or leak their diagnostics here.
+fn adoption_scoped_plan(source: &plan::Plan, applicable: bool) -> plan::Plan {
+    let entries = source
+        .entries
+        .iter()
+        .filter(|entry| entry.action == plan::PlanAction::Adoptable)
+        .cloned()
+        .collect::<Vec<_>>();
+    let destinations = entries
+        .iter()
+        .map(|entry| entry.destination.as_path())
+        .collect::<BTreeSet<_>>();
+    plan::Plan {
+        schema_version: source.schema_version,
+        applicable,
+        diagnostics: source
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .path_utf8
+                    .as_deref()
+                    .is_some_and(|path| destinations.contains(Path::new(path)))
+            })
+            .cloned()
+            .collect(),
+        entries,
+        operations: Vec::new(),
+    }
+}
+
 fn adoption_entries(
     transition: &LifecycleTransition,
     roots: &ResolvedRoots,
@@ -1289,7 +1333,7 @@ mod tests {
     };
     use crate::lifecycle::LifecycleTransition;
     use crate::output::OutputStatus;
-    use crate::plan::{Owner, Plan, PlanAction, PlanEntry};
+    use crate::plan::{Owner, OwnershipClaim, Plan, PlanAction, PlanEntry};
     use crate::provider::{PathDiagnostic, ProviderId, ResolveError, resolve_roots_from};
     use crate::receipt::Receipt;
     use crate::should_use_tui;
@@ -1408,6 +1452,7 @@ mod tests {
                     destination,
                     owner: Owner::Unmanaged,
                     reason: "matching unmanaged asset".to_owned(),
+                    ownership: OwnershipClaim::None,
                 }],
                 operations: Vec::new(),
                 diagnostics: Vec::new(),

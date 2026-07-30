@@ -558,25 +558,31 @@ fn matching_vercel_v3_installation_can_be_adopted_atomically() -> TestResult {
         home.path()
             .join(".agents/.arthur-workflow/pre-adoption-receipt.json"),
     )?;
+    // A Vercel Skills v3 installation owns skills only; Arthur agents and
+    // support files are never part of it.
     fs::remove_dir_all(home.path().join(".claude/agents"))?;
+    fs::remove_dir_all(home.path().join(".claude/skills/_shared"))?;
 
-    let missing_lock = run(
-        home.path(),
-        &["--json", "adopt", "--provider", "claude", "--dry-run"],
-    )?;
-    assert_eq!(missing_lock.status.code(), Some(3));
-    assert_eq!(json_output(&missing_lock)?["status"], "blocked");
-
-    fs::write(
-        home.path().join(".agents/.skill-lock.json"),
-        br#"{"version":3,"skills":{}}"#,
-    )?;
-    let blocked = run(
-        home.path(),
-        &["--json", "adopt", "--provider", "claude", "--dry-run"],
-    )?;
-    assert_eq!(blocked.status.code(), Some(3));
-    assert_eq!(json_output(&blocked)?["status"], "blocked");
+    // Without a verified lock entry, adopt has nothing in scope: the homonym
+    // collisions belong to a reconcile request, not to this command.
+    for lock in [None, Some(br#"{"version":3,"skills":{}}"#.as_slice())] {
+        if let Some(bytes) = lock {
+            fs::write(home.path().join(".agents/.skill-lock.json"), bytes)?;
+        }
+        let output = run(
+            home.path(),
+            &["--json", "adopt", "--provider", "claude", "--dry-run"],
+        )?;
+        assert_eq!(output.status.code(), Some(0), "{lock:?}");
+        let envelope = json_output(&output)?;
+        assert_eq!(envelope["status"], "noop", "{lock:?}");
+        assert_eq!(envelope["data"]["adopted"], 0, "{lock:?}");
+        assert_eq!(
+            envelope["operations"].as_array().map(Vec::len),
+            Some(0),
+            "{lock:?}"
+        );
+    }
 
     write_v3_lock_for_installed_skills(home.path())?;
     let foreign_asset = home.path().join(".agents/skills/personal/SKILL.md");

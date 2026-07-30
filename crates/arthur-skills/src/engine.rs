@@ -2,8 +2,8 @@ use std::fmt;
 
 use crate::adoption::{AdoptionPlan, EntryType};
 use crate::plan::{
-    AllowedRoot, ClaudeSymlinkPolicy, DesiredAsset, ExpectedNode, NodeKind, OwnedAssetState,
-    PathPolicy, Plan, RemovalPolicy, build_plan_with_removal_policy,
+    AllowedRoot, ClaudeSymlinkPolicy, DesiredAsset, ExpectedNode, LegacyOwnership, NodeKind,
+    OwnedAssetState, PathPolicy, Plan, RemovalPolicy, build_plan_with_removal_policy,
 };
 use crate::provider::{ProviderId, ResolvedRoots};
 use crate::receipt::{OwnedAsset, OwnedAssetKind, Receipt, ReceiptError, ReceiptState};
@@ -49,13 +49,20 @@ pub fn plan_desired_state(
     receipt: Option<&Receipt>,
     desired: &[DesiredAsset],
 ) -> Result<Plan, EngineError> {
-    plan_desired_state_with_removal_policy(roots, receipt, desired, RemovalPolicy::BlockOnDrift)
+    plan_desired_state_with_removal_policy(
+        roots,
+        receipt,
+        desired,
+        &LegacyOwnership::default(),
+        RemovalPolicy::BlockOnDrift,
+    )
 }
 
 pub fn plan_desired_state_with_removal_policy(
     roots: &ResolvedRoots,
     receipt: Option<&Receipt>,
     desired: &[DesiredAsset],
+    legacy: &LegacyOwnership,
     removal_policy: RemovalPolicy,
 ) -> Result<Plan, EngineError> {
     let owned = match receipt {
@@ -85,6 +92,7 @@ pub fn plan_desired_state_with_removal_policy(
     Ok(build_plan_with_removal_policy(
         desired,
         &owned,
+        legacy,
         &PathPolicy {
             allowed_roots,
             claude_symlinks,

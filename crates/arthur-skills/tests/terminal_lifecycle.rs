@@ -264,35 +264,32 @@ fn tui_adoption_can_cancel_then_confirm_the_same_verified_plan() -> Result<(), B
 
 #[test]
 fn real_cli_imports_updates_and_reports_an_aligned_configuration() -> Result<(), Box<dyn Error>> {
+    // A Vercel Skills v3 installation: only the skills its lock names exist,
+    // with no Arthur receipt, agent or support file.
     let home = tempfile::tempdir()?;
-    let install = Command::new(env!("CARGO_BIN_EXE_arthur-skills"))
-        .args(["--json", "install", "--provider", "claude,codex", "--yes"])
-        .env("HOME", home.path())
-        .env_remove("CODEX_HOME")
-        .output()?;
-    assert!(
-        install.status.success(),
-        "{}",
-        String::from_utf8_lossy(&install.stdout)
-    );
-    fs::remove_file(home.path().join(".agents/.arthur-workflow/receipt.json"))?;
-    fs::write(
-        home.path().join(".agents/skills/baseline-ui/SKILL.md"),
-        b"old catalog content",
-    )?;
+    let drifted_skill = home.path().join(".agents/skills/baseline-ui/SKILL.md");
     let obsolete = home
         .path()
         .join(".agents/skills/obsolete-arthur-skill/SKILL.md");
-    fs::create_dir_all(obsolete.parent().ok_or("obsolete skill has no parent")?)?;
-    fs::write(&obsolete, b"obsolete")?;
     let personal = home.path().join(".agents/skills/personal/SKILL.md");
-    fs::create_dir_all(personal.parent().ok_or("personal skill has no parent")?)?;
+    for path in [&drifted_skill, &obsolete, &personal] {
+        fs::create_dir_all(path.parent().ok_or("legacy skill has no parent")?)?;
+    }
+    fs::write(&drifted_skill, b"old catalog content")?;
+    fs::write(&obsolete, b"obsolete")?;
     fs::write(&personal, b"personal")?;
     fs::write(
         home.path().join(".agents/.skill-lock.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "version": 3,
             "skills": {
+                "baseline-ui": {
+                    "source": "arthjean/skills",
+                    "sourceType": "github",
+                    "skillFolderHash": "89abcdef0123456789abcdef0123456789abcdef",
+                    "installedAt": "2026-01-01T00:00:00.000Z",
+                    "updatedAt": "2026-01-01T00:00:00.000Z"
+                },
                 "obsolete-arthur-skill": {
                     "source": "arthjean/skills",
                     "sourceType": "github",
@@ -321,6 +318,11 @@ fn real_cli_imports_updates_and_reports_an_aligned_configuration() -> Result<(),
     );
     assert!(!obsolete.exists());
     assert_eq!(fs::read(&personal)?, b"personal");
+    assert_ne!(
+        fs::read(&drifted_skill)?,
+        b"old catalog content",
+        "the lock proves this skill, so import updates it to the bundled catalog"
+    );
     let residual: serde_json::Value =
         serde_json::from_slice(&fs::read(home.path().join(".agents/.skill-lock.json"))?)?;
     assert!(residual["skills"].get("obsolete-arthur-skill").is_none());

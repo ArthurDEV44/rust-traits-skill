@@ -348,7 +348,8 @@ pub fn inspect_legacy_import(
         .0
         .iter()
         .filter(|(name, entry)| {
-            catalog_skill_names.contains(*name) || is_arthur_catalog_source(&entry.source)
+            names_one_directory(name)
+                && (catalog_skill_names.contains(*name) || is_arthur_catalog_source(&entry.source))
         })
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
@@ -357,7 +358,9 @@ pub fn inspect_legacy_import(
         .0
         .iter()
         .filter(|(name, entry)| {
-            !catalog_skill_names.contains(*name) && is_arthur_catalog_source(&entry.source)
+            names_one_directory(name)
+                && !catalog_skill_names.contains(*name)
+                && is_arthur_catalog_source(&entry.source)
         })
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
@@ -384,6 +387,18 @@ pub fn inspect_legacy_import(
         managed_skill_names,
         obsolete_skill_names,
     }))
+}
+
+/// A v3 lock key names one skill directory. An empty key, a separator, a
+/// traversal or an absolute path can never address a managed destination, so it
+/// proves nothing and stays in the residual lock.
+fn names_one_directory(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    let single = matches!(
+        components.next(),
+        Some(std::path::Component::Normal(component)) if component == std::ffi::OsStr::new(name)
+    );
+    single && components.next().is_none()
 }
 
 fn is_arthur_catalog_source(source: &str) -> bool {

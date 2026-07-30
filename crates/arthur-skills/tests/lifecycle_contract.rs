@@ -6,13 +6,16 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use arthur_skills::adoption::{self, LegacyImportPlan};
 use arthur_skills::catalog::{AssetKind, Catalog, Provider as CatalogProvider};
 use arthur_skills::lifecycle::{
     LifecycleError, LifecycleIntent, LifecycleNoticeCode, LifecycleTransition,
     prepare_import_transition, prepare_lifecycle_transition, prepare_reconciliation_transition,
 };
 use arthur_skills::operations::{operations_for_import, operations_for_plan};
-use arthur_skills::plan::PlanAction;
+use arthur_skills::plan::{
+    MATCHING_UNMANAGED_WITHOUT_PROOF, OwnershipBasis, OwnershipClaim, PlanAction,
+};
 use arthur_skills::provider::{ProviderId, ResolvedRoots, resolve_roots_from};
 use arthur_skills::receipt::{OwnedAsset, OwnedAssetKind, Receipt, RetainedUnmanagedAsset};
 use arthur_skills::transaction::{
@@ -81,10 +84,56 @@ fn install_both(
         &LifecycleIntent::Install {
             providers: vec![ProviderId::Claude, ProviderId::Codex],
         },
+        None,
     )?;
     assert!(transition.plan.applicable);
     apply(roots, &transition, transaction_id)?;
     Ok(transition)
+}
+
+fn write_legacy_lock(roots: &ResolvedRoots, names: &[&str]) -> TestResult {
+    let mut skills = serde_json::Map::new();
+    for name in names {
+        skills.insert(
+            (*name).to_owned(),
+            serde_json::json!({
+                "source": "arthjean/skills",
+                "sourceType": "github",
+                "skillFolderHash": "0123456789012345678901234567890123456789",
+                "installedAt": "2026-01-01T00:00:00.000Z",
+                "updatedAt": "2026-01-01T00:00:00.000Z"
+            }),
+        );
+    }
+    fs::create_dir_all(
+        roots
+            .legacy_lock_path
+            .parent()
+            .ok_or("legacy lock has no parent")?,
+    )?;
+    fs::write(
+        &roots.legacy_lock_path,
+        serde_json::to_vec_pretty(&serde_json::json!({ "version": 3, "skills": skills }))?,
+    )?;
+    Ok(())
+}
+
+fn legacy_import_plan(
+    catalog: &Catalog,
+    roots: &ResolvedRoots,
+) -> Result<Option<LegacyImportPlan>, Box<dyn Error>> {
+    let names = catalog
+        .manifest()
+        .assets
+        .iter()
+        .filter(|asset| asset.kind == AssetKind::Skill)
+        .map(|asset| asset.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(adoption::inspect_legacy_import(
+        &roots.legacy_lock_path,
+        &roots.state_directory.join("vercel-skills-v3-lock.json"),
+        &names,
+    )?)
 }
 
 fn provider_managed(receipt: &Receipt, provider: ProviderId) -> bool {
@@ -222,12 +271,53 @@ fn homonyms_require_adoption_and_owned_drift_blocks_reconciliation() -> TestResu
         &LifecycleIntent::Install {
             providers: vec![ProviderId::Codex],
         },
+        None,
     )?;
     assert!(!blocked.plan.applicable);
     assert!(
         blocked.plan.entries.iter().any(|entry| {
-            entry.destination == collision && entry.action == PlanAction::Adoptable
-        })
+            entry.destination == collision
+                && entry.action == PlanAction::Conflict
+                && entry.ownership == OwnershipClaim::None
+        }),
+        "a homonym without proof is a conflict, never an adoption candidate"
+    );
+    assert!(blocked.plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == MATCHING_UNMANAGED_WITHOUT_PROOF
+            && diagnostic.path_utf8.as_deref() == collision.to_str()
+    }));
+    assert!(blocked.receipt.owned_asset(&collision).is_none());
+
+    write_legacy_lock(&collision_roots, &["baseline-ui"])?;
+    let legacy = legacy_import_plan(&catalog, &collision_roots)?
+        .ok_or("the legacy lock proves no catalog skill")?;
+    let proven = prepare_lifecycle_transition(
+        &catalog,
+        &collision_roots,
+        None,
+        &LifecycleIntent::Install {
+            providers: vec![ProviderId::Codex],
+        },
+        Some(&legacy),
+    )?;
+    let adoptable = proven
+        .plan
+        .entries
+        .iter()
+        .find(|entry| entry.destination == collision)
+        .ok_or("the proven collision is absent from the plan")?;
+    assert_eq!(adoptable.action, PlanAction::Adoptable);
+    assert_eq!(adoptable.ownership_basis(), OwnershipBasis::VerifiedLegacy);
+    assert_eq!(
+        adoptable.ownership.source_id().map(String::as_str),
+        Some("baseline-ui")
+    );
+    assert!(
+        proven
+            .plan
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != MATCHING_UNMANAGED_WITHOUT_PROOF)
     );
 
     let home = tempfile::tempdir()?;
@@ -242,6 +332,7 @@ fn homonyms_require_adoption_and_owned_drift_blocks_reconciliation() -> TestResu
         &LifecycleIntent::Install {
             providers: vec![ProviderId::Claude, ProviderId::Codex],
         },
+        None,
     )?;
     assert!(!drifted.plan.applicable);
     assert!(
@@ -266,6 +357,7 @@ fn homonyms_require_adoption_and_owned_drift_blocks_reconciliation() -> TestResu
         &LifecycleIntent::Install {
             providers: vec![ProviderId::Claude, ProviderId::Codex],
         },
+        None,
     )?;
     assert!(update.plan.applicable);
     assert!(
@@ -290,22 +382,36 @@ fn import_and_reconciliation_repair_catalog_assets_without_claiming_personal_ass
 {
     let catalog = Catalog::load()?;
 
+    // A Vercel Skills v3 installation: canonical skills the lock names, an
+    // unrelated personal skill, and no Arthur agent or support file.
     let import_home = tempfile::tempdir()?;
     let import_roots = roots(&import_home, &ProviderId::ALL)?;
-    install_both(&catalog, &import_roots, "prepare-import")?;
-    fs::remove_file(&import_roots.receipt_path)?;
     let drifted_skill = import_roots.canonical_skills.join("baseline-ui/SKILL.md");
     let missing_agent = import_home
         .path()
         .join(".codex/agents/docs-researcher.toml");
     let personal = import_roots.canonical_skills.join("personal/SKILL.md");
+    for path in [&drifted_skill, &personal] {
+        fs::create_dir_all(path.parent().ok_or("legacy skill has no parent")?)?;
+    }
     fs::write(&drifted_skill, b"old Arthur content")?;
-    fs::remove_file(&missing_agent)?;
-    fs::create_dir_all(personal.parent().ok_or("personal skill has no parent")?)?;
     fs::write(&personal, b"personal")?;
+    write_legacy_lock(&import_roots, &["baseline-ui"])?;
+    let legacy = legacy_import_plan(&catalog, &import_roots)?
+        .ok_or("the legacy lock proves no catalog skill")?;
 
-    let imported = prepare_import_transition(&catalog, &import_roots, &ProviderId::ALL, None)?;
-    assert!(imported.plan.applicable);
+    let imported =
+        prepare_import_transition(&catalog, &import_roots, &ProviderId::ALL, Some(&legacy))?;
+    assert!(
+        imported.plan.applicable,
+        "{:?}",
+        imported
+            .plan
+            .entries
+            .iter()
+            .filter(|entry| entry.action == PlanAction::Conflict)
+            .collect::<Vec<_>>()
+    );
     assert!(
         imported.plan.entries.iter().any(|entry| {
             entry.destination == drifted_skill && entry.action == PlanAction::Update
@@ -316,10 +422,22 @@ fn import_and_reconciliation_repair_catalog_assets_without_claiming_personal_ass
             entry.destination == missing_agent && entry.action == PlanAction::Create
         })
     );
+    // The lock proves one skill; nothing else observed on disk may be claimed.
+    assert!(imported.plan.entries.iter().all(|entry| {
+        entry.ownership_basis() != OwnershipBasis::VerifiedLegacy
+            || entry
+                .destination
+                .starts_with(import_roots.canonical_skills.join("baseline-ui"))
+            || entry
+                .destination
+                .starts_with(import_home.path().join(".claude/skills/baseline-ui"))
+    }));
+    assert!(imported.receipt.owned_asset(&personal).is_none());
+
     let operations = operations_for_import(
         &imported.plan,
-        &import_roots.canonical.lexical.join(".skill-lock.json"),
-        None,
+        &import_roots.legacy_lock_path,
+        Some(&legacy),
         &import_roots,
         &imported.receipt,
         "import-existing",
@@ -331,7 +449,8 @@ fn import_and_reconciliation_repair_catalog_assets_without_claiming_personal_ass
         TransactionOutcome::Committed
     );
     assert_eq!(fs::read(&personal)?, b"personal");
-    assert!(imported.receipt.owned_asset(&personal).is_none());
+    let committed = Receipt::decode(&fs::read(&import_roots.receipt_path)?)?;
+    assert!(committed.owned_asset(&personal).is_none());
 
     let update_home = tempfile::tempdir()?;
     let update_roots = roots(&update_home, &ProviderId::ALL)?;
@@ -368,6 +487,7 @@ fn provider_uninstall_preserves_references_and_full_uninstall_releases_drift() -
         &roots,
         Some(&installed.receipt),
         &LifecycleIntent::UninstallProvider(ProviderId::Codex),
+        None,
     )?;
     assert!(codex_only_removal.plan.applicable);
     assert!(codex_only_removal.plan.entries.iter().all(|entry| {
@@ -382,6 +502,7 @@ fn provider_uninstall_preserves_references_and_full_uninstall_releases_drift() -
         &roots,
         Some(&installed.receipt),
         &LifecycleIntent::UninstallProvider(ProviderId::Claude),
+        None,
     )?;
     assert!(claude_removed.plan.applicable);
     assert!(claude_removed.plan.entries.iter().all(|entry| {
@@ -421,6 +542,7 @@ fn provider_uninstall_preserves_references_and_full_uninstall_releases_drift() -
         &roots,
         Some(&claude_removed.receipt),
         &LifecycleIntent::UninstallAll,
+        None,
     )?;
     assert!(uninstall_all.plan.applicable);
     assert!(uninstall_all.plan.entries.iter().any(|entry| {
@@ -522,6 +644,7 @@ fn non_utf8_foreign_entry_blocks_uninstall_before_mutation() -> TestResult {
         &LifecycleIntent::Install {
             providers: vec![ProviderId::Codex],
         },
+        None,
     )?;
     apply(&roots, &installed, "non-utf8-install")?;
 
@@ -535,6 +658,7 @@ fn non_utf8_foreign_entry_blocks_uninstall_before_mutation() -> TestResult {
         &roots,
         Some(&installed.receipt),
         &LifecycleIntent::UninstallAll,
+        None,
     )?;
     assert!(!uninstall.plan.applicable);
     assert!(
@@ -571,6 +695,7 @@ fn provider_container_type_conflicts_block_planning() -> TestResult {
                 &LifecycleIntent::Install {
                     providers: vec![provider],
                 },
+                None,
             ),
             Err(LifecycleError::UnsafeContainer { .. })
         ));
@@ -592,6 +717,7 @@ fn uninstall_failure_rolls_back_assets_and_receipt_together() -> TestResult {
         &roots,
         Some(&installed.receipt),
         &LifecycleIntent::UninstallProvider(ProviderId::Claude),
+        None,
     )?;
     let operations = operations_for_plan(
         &transition.plan,

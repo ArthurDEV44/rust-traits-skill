@@ -205,7 +205,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{WorkflowState, assess};
-    use crate::plan::{Owner, PLAN_SCHEMA_VERSION, Plan, PlanAction, PlanEntry};
+    use crate::plan::{Owner, OwnershipClaim, PLAN_SCHEMA_VERSION, Plan, PlanAction, PlanEntry};
     use crate::provider::resolve_roots_from;
     use crate::receipt::Receipt;
 
@@ -216,6 +216,7 @@ mod tests {
             destination: PathBuf::from(format!("/tmp/{source}")),
             owner: Owner::Unmanaged,
             reason: reason.to_owned(),
+            ownership: OwnershipClaim::None,
         }
     }
 

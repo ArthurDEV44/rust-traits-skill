@@ -240,7 +240,7 @@ mod tests {
 
     use super::{PlainExit, confirm_plan, read_line, render_review, select_providers};
     use crate::app::{App, Provider, Review};
-    use crate::plan::{Owner, PlanAction, PlanEntry};
+    use crate::plan::{Owner, OwnershipClaim, PlanAction, PlanEntry};
     use crate::transaction::SignalFlags;
     use crate::workflow::{AssetSummary, WorkflowAssessment, WorkflowState};
 
@@ -350,6 +350,7 @@ mod tests {
                 destination: "/home/user/.agents/skills/coss/SKILL.md".into(),
                 owner: Owner::ArthurWorkflow,
                 reason: "managed path needs an update".to_owned(),
+                ownership: OwnershipClaim::None,
             },
             PlanEntry {
                 action: PlanAction::Create,
@@ -357,6 +358,7 @@ mod tests {
                 destination: "/home/user/.codex/agents/docs-researcher.toml".into(),
                 owner: Owner::ArthurWorkflow,
                 reason: "managed path is missing".to_owned(),
+                ownership: OwnershipClaim::None,
             },
         ];
         let mut app = App::new(1, &[]);

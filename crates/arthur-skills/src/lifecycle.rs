@@ -9,7 +9,10 @@ use serde::Serialize;
 use crate::adoption::LegacyImportPlan;
 use crate::catalog::{AssetKind, Catalog, Provider as CatalogProvider};
 use crate::engine::{EngineError, plan_desired_state_with_removal_policy};
-use crate::plan::{DesiredAsset, DesiredPayload, Plan, PlanAction, RemovalPolicy};
+use crate::plan::{
+    DesiredAsset, DesiredPayload, LegacyOwnership, LegacyProofScope, Plan, PlanAction,
+    RemovalPolicy,
+};
 use crate::provider::{ProviderId, ProviderRegistry, ResolvedProvider, ResolvedRoots};
 use crate::receipt::{OwnedAsset, OwnedAssetKind, Receipt, ReceiptError, RetainedUnmanagedAsset};
 use crate::transaction::{PathKind, snapshot_path};
@@ -130,11 +133,44 @@ struct ManagedDesired {
     references: Vec<ProviderId>,
 }
 
+/// Maps every verified v3 lock entry to the destinations it can prove.
+///
+/// The v3 lock records one entry per skill name and carries no per-file, agent
+/// or support record, so a proven entry covers exactly its canonical skill
+/// directory and the Claude activation strictly derivable from the same name.
+/// Every other observed path stays unproven.
+fn legacy_ownership(roots: &ResolvedRoots, legacy: Option<&LegacyImportPlan>) -> LegacyOwnership {
+    let Some(legacy) = legacy else {
+        return LegacyOwnership::default();
+    };
+    let claude_skills = roots
+        .provider(ProviderId::Claude)
+        .and_then(|provider| provider.skills.as_deref());
+    let mut scopes = Vec::new();
+    for name in legacy
+        .managed_skill_names
+        .iter()
+        .chain(legacy.obsolete_skill_names.iter())
+    {
+        for root in std::iter::once(roots.canonical_skills.join(name))
+            .chain(claude_skills.map(|skills| skills.join(name)))
+        {
+            scopes.push(LegacyProofScope {
+                root,
+                source_id: name.clone(),
+                lock_sha256: legacy.original_hash.clone(),
+            });
+        }
+    }
+    LegacyOwnership::new(scopes)
+}
+
 pub fn prepare_lifecycle_transition(
     catalog: &Catalog,
     roots: &ResolvedRoots,
     current: Option<&Receipt>,
     intent: &LifecycleIntent,
+    legacy: Option<&LegacyImportPlan>,
 ) -> Result<LifecycleTransition, LifecycleError> {
     if let Some(receipt) = current {
         receipt.validate()?;
@@ -167,7 +203,13 @@ pub fn prepare_lifecycle_transition(
     } else {
         RemovalPolicy::BlockOnDrift
     };
-    let plan = plan_desired_state_with_removal_policy(roots, current, &desired, removal_policy)?;
+    let plan = plan_desired_state_with_removal_policy(
+        roots,
+        current,
+        &desired,
+        &legacy_ownership(roots, legacy),
+        removal_policy,
+    )?;
     let receipt = build_receipt(
         catalog,
         roots,
@@ -214,7 +256,14 @@ pub fn prepare_import_transition(
     for provider in &mut baseline.providers {
         provider.managed_integration = selected_providers.contains(&provider.provider);
     }
+    // Only a verified v3 lock entry can seed a baseline without a prior
+    // receipt. Every other observed destination stays unproven, so the planner
+    // classifies it instead of the import silently claiming it.
+    let proofs = legacy_ownership(roots, legacy);
     for entry in managed.values() {
+        if proofs.proof_for(&entry.asset.destination).is_none() {
+            continue;
+        }
         if let Some(asset) = observed_owned_asset(
             &entry.asset.source_id,
             &entry.asset.destination,
@@ -238,7 +287,14 @@ pub fn prepare_import_transition(
         .sort_by(|left, right| left.destination.cmp(&right.destination));
     baseline.validate()?;
 
-    transition_from_baseline(catalog, roots, &baseline, &selected_providers, managed)
+    transition_from_baseline(
+        catalog,
+        roots,
+        &baseline,
+        &selected_providers,
+        managed,
+        &proofs,
+    )
 }
 
 pub fn prepare_reconciliation_transition(
@@ -268,48 +324,32 @@ pub fn prepare_reconciliation_transition(
         .flatten()
         .map(|asset| (asset.destination.clone(), asset))
         .collect::<BTreeMap<_, _>>();
-    if let Some(legacy) = legacy {
-        let legacy_names = legacy
-            .managed_skill_names
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        for entry in managed.values() {
-            if catalog_skill_name(&entry.asset.source_id)
-                .is_some_and(|name| legacy_names.contains(name))
-                && !observed.contains_key(&entry.asset.destination)
-                && let Some(asset) = observed_owned_asset(
-                    &entry.asset.source_id,
-                    &entry.asset.destination,
-                    &entry.references,
-                )?
-            {
-                // The v3 lock proves legacy ownership. Recording the observed
-                // state lets the planner update an older catalog version safely.
-                observed.insert(asset.destination.clone(), asset);
-            }
+    let proofs = legacy_ownership(roots, legacy);
+    for entry in managed.values() {
+        if proofs.proof_for(&entry.asset.destination).is_some()
+            && !observed.contains_key(&entry.asset.destination)
+            && let Some(asset) = observed_owned_asset(
+                &entry.asset.source_id,
+                &entry.asset.destination,
+                &entry.references,
+            )?
+        {
+            // The v3 lock proves legacy ownership. Recording the observed
+            // state lets the planner update an older catalog version safely.
+            observed.insert(asset.destination.clone(), asset);
         }
     }
     baseline.assets = observed.into_values().collect();
     baseline.validate()?;
 
-    transition_from_baseline(catalog, roots, &baseline, &selected_providers, managed)
-}
-
-fn catalog_skill_name(source_id: &str) -> Option<&str> {
-    if let Some(source) = source_id.strip_prefix("activation:claude:") {
-        let source = source
-            .strip_prefix("directory:skills/")
-            .or_else(|| source.strip_prefix("skills/"))
-            .unwrap_or(source);
-        return source.split('/').next().filter(|name| !name.is_empty());
-    }
-    source_id
-        .strip_prefix("directory:")
-        .unwrap_or(source_id)
-        .strip_prefix("skills/")
-        .and_then(|source| source.split('/').next())
-        .filter(|name| !name.is_empty())
+    transition_from_baseline(
+        catalog,
+        roots,
+        &baseline,
+        &selected_providers,
+        managed,
+        &proofs,
+    )
 }
 
 fn transition_from_baseline(
@@ -318,6 +358,7 @@ fn transition_from_baseline(
     baseline: &Receipt,
     selected_providers: &[ProviderId],
     managed: BTreeMap<PathBuf, ManagedDesired>,
+    legacy: &LegacyOwnership,
 ) -> Result<LifecycleTransition, LifecycleError> {
     let desired = managed
         .values()
@@ -327,6 +368,7 @@ fn transition_from_baseline(
         roots,
         Some(baseline),
         &desired,
+        legacy,
         RemovalPolicy::BlockOnDrift,
     )?;
     let receipt = build_receipt(
@@ -976,7 +1018,20 @@ fn build_receipt(
             });
         }
     }
-    receipt.assets = managed.values().map(owned_asset).collect();
+    // A projected receipt may only claim destinations the plan proved. A
+    // conflicting or unproven path is never written as owned, whatever its
+    // name or bytes.
+    let provable = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.ownership_basis().is_provable())
+        .map(|entry| entry.destination.as_path())
+        .collect::<BTreeSet<_>>();
+    receipt.assets = managed
+        .values()
+        .filter(|entry| provable.contains(entry.asset.destination.as_path()))
+        .map(owned_asset)
+        .collect();
 
     let mut retained = current
         .into_iter()
