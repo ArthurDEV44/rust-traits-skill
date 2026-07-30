@@ -1,6 +1,6 @@
 ---
 name: review-epic
-description: Review and correct one already-implemented PRD epic (`EP-NNN`) as a single unit across its dependency-ordered child stories, with risk-profiled auditing, one consolidated verification pass, and status roll-up. Use when asked to review an epic, validate an implemented EP-NNN, or replace story-by-story review with one epic-level session.
+description: "Review and correct one already-implemented PRD epic (`EP-NNN`) as a single unit, then validate its final state and roll up story, epic, and PRD status. Use when asked to review an epic, validate an implemented EP-NNN, recheck a completed epic, or replace story-by-story review with one dependency-aware audit."
 ---
 
 # review-epic
@@ -9,112 +9,132 @@ Review: $ARGUMENTS
 
 ## Objective
 
-Prove that one implemented epic satisfies its outcome, child acceptance criteria, integration contracts, and applicable security boundaries. Correct confirmed defects, run one consolidated verification bundle, then roll up story, epic, and PRD status.
+Prove one implemented epic against its outcome, child criteria, integration contracts, and applicable security boundaries. Correct confirmed defects and certify only the final repository state.
 
-`SCOPE -> AUDIT -> REMEDIATE -> VERIFY -> STATUS`
+`SCOPE -> AUDIT -> REMEDIATE -> VERIFY/STATUS`
 
-Print one compact progress line per phase. Maintain a `Proof Ledger` under 300 tokens containing: epic ID, dependency-ordered child stories, review baseline, criterion evidence, review files, context files, risk axes, confirmed findings, commands, status path, and blockers. Update it instead of repeating plans.
-
-The epic is the execution unit. Child stories organize acceptance evidence and dependency reasoning; they never trigger separate review pipelines.
+The epic is the execution unit. Child stories organize evidence and dependency reasoning; they never trigger separate review pipelines. Report only meaningful milestones, scope ambiguity, confirmed blockers, and the final receipt.
 
 ## Profiles
 
-Select the lowest profile covering the highest-risk changed surface. An explicit profile may escalate but never hide a DEEP condition.
+Select the lowest profile covering the highest-risk changed surface.
 
-| Profile | Use when | Independent audit | Verification budget |
-|---|---|---|---|
-| FAST | Isolated behavior, clear in-repo pattern, bounded failure impact, no sensitive boundary | None; orchestrator audits the epic diff | At most 2 commands |
-| DEFAULT | Shared integration, public behavior, multi-module change, or a familiar new dependency | One correctness review | At most 4 commands |
-| DEEP | Auth, payments, PII, destructive data operations, migration, untrusted shell/file/network input, crypto, LLM tools, cross-service behavior, or genuinely unfamiliar logic | One primary risk axis; add a second axis only when correctness and security are distinct high-risk questions | At most 6 commands |
+| Profile | Use when | Audit and validation |
+|---|---|---|
+| FAST | Isolated behavior, established local pattern, bounded impact, no sensitive boundary | Orchestrator audit plus acceptance and changed-surface gates |
+| DEFAULT | Shared integration, public behavior, multi-module change, or familiar dependency work | Orchestrator audit plus acceptance, integration, and applicable project gates |
+| DEEP | Auth, payments, PII, migration, untrusted input, crypto, destructive operations, LLM tools, cross-service behavior, or unfamiliar critical logic | Orchestrator audit, optional single-axis independent review, relevant full suite, and applicable security gates |
 
-File count alone never selects DEEP.
+File count alone does not select DEEP.
 
-## Phase 1 - SCOPE
+## Phase 1: SCOPE
 
-1. Parse the PRD path, `EP-NNN`, optional `--profile fast|default|deep`, and optional `--base <git-ref>`. With no epic ID, select the first epic whose non-cancelled children are all `DONE` or `IN_REVIEW` and whose review is incomplete (`reviewed_at: null` on at least one child). Log the choice.
-2. Read the PRD and adjacent status JSON. Extract the epic outcome, definition of done, non-goals, child stories, dependencies, acceptance criteria, explicit quality gates, and files excluded by the PRD.
-3. Include every non-cancelled child story, including stories already marked `DONE`, and topologically order them for evidence mapping. If the tracker contains `TODO`, `IN_PROGRESS`, or `BLOCKED` children, inspect only enough local evidence to distinguish stale status from incomplete implementation. Correct stale status in Phase 5; stop with the incomplete children when the epic is genuinely unfinished.
-4. Capture branch, HEAD, worktree state, and review baseline. Prefer explicit `--base`; otherwise use the current branch merge-base with `main` or `master`, then include staged, unstaged, and relevant untracked files.
-5. Build the epic file set by mapping each candidate file to at least one child criterion, the epic outcome, or a shared integration point. Preserve unrelated user changes. Treat direct callers and imports as read-only context. Exclude lock files, generated code, vendor/build output, and binary assets unless the epic explicitly changes them. Keep a changed manifest in scope.
-6. If several epics share the branch and local evidence cannot isolate this epic, stop with the exact ambiguous files and baseline instead of reviewing unrelated work.
-7. Select the profile from the changed attack surface and integration risk.
-8. Build the Proof Ledger and a one-screen review card: epic outcome, ordered stories, criterion-to-proof plan, review files, context files, baseline, profile, risk axes, and final gate bundle.
+1. Resolve the PRD path, epic ID, optional profile, and optional `--base <git-ref>`. If no epic is named, select the first epic whose non-cancelled children are implemented but review is incomplete.
+2. Read the PRD and adjacent status data. Extract the outcome, definition of done, non-goals, child stories, dependencies, acceptance criteria, explicit quality gates, and excluded scope.
+3. Include every non-cancelled child, including stories already marked `DONE`, and order them by dependency.
+4. If a child is `TODO`, `IN_PROGRESS`, or `BLOCKED`, inspect only enough evidence to distinguish stale status from incomplete implementation. Correct stale status after review; stop when implementation is genuinely incomplete.
+5. Capture branch, HEAD, worktree state, and the review baseline. Prefer explicit `--base`; otherwise use the repository default branch merge-base only when it isolates the epic unambiguously. Include relevant committed, staged, unstaged, and untracked changes.
+6. Map every changed artifact to a child criterion, the epic outcome, or a shared integration point. Preserve unrelated work. Use callers and imports as read-only context.
+7. Do not blanket-exclude lockfiles, generated files, or binary artifacts. Review their source or metadata and validate source-to-artifact consistency when they affect the epic.
+8. Stop with the exact ambiguous files and baseline when several epics cannot be isolated safely.
+9. Select the risk profile and create one compact evidence map:
 
-Use an evidence helper only for one named uncertainty that local code, PRD, and history cannot resolve. FAST uses no helper. DEFAULT uses at most one. DEEP uses at most two for distinct gaps. Read [Phase Protocols](references/phase-protocols.md) only when a helper or independent audit is required.
+```text
+criterion | PASS | FAIL | MANUAL_PROVEN | MANUAL_PENDING
+evidence  | file:line, test, command, artifact, observation, or missing proof
+```
 
-**Gate:** One epic, its ordered child stories, exact diff, profile, proof plan, and verification bundle are known.
+**Gate:** The epic contract, ordered stories, exact diff, profile, and criterion map are known.
 
-## Phase 2 - AUDIT
+## Conditional Evidence
 
-1. Read the complete epic diff once from the Phase 1 baseline. Read full files only where the diff lacks enough context.
-2. Map every child acceptance criterion to `PASS`, `PARTIAL`, `FAIL`, or `MANUAL`, with `file:line`, test, command, or explicit missing evidence. Check the epic definition of done after all child mappings.
-3. Review cross-story integration in dependency order. Focus on contract mismatches between slices, invalid state transitions, missing unhappy paths, regressions at shared integration points, and criteria implemented in isolation but broken in composition.
-4. Audit applicable correctness, error handling, test, performance, and security boundaries. Inspect secrets and dependencies only when config or manifests changed. Use current documentation or advisories only to resolve a version-sensitive claim that materially affects the verdict.
-5. Apply the profile:
-   - FAST: complete the orchestrator audit without a helper.
-   - DEFAULT: launch one fresh-context correctness review over the epic diff and one-hop context.
-   - DEEP: launch one correctness or security audit for the primary risk axis. Launch both in parallel only when they answer distinct high-risk questions.
-6. Verify every proposed finding directly against the cited code and surrounding context. Keep only `CONFIRMED` findings. Classify them as mandatory (`CRITICAL`, `HIGH`, `MUST_FIX`), scoped improvement (`MEDIUM`, `SHOULD_FIX`), or tracked outside the epic.
+Use the PRD, local code, tests, history, and installed metadata as the default evidence.
 
-Cap independent output at four high-value findings per file and 800 tokens per axis. Require `file:line`, affected criterion or epic outcome, concrete failure path, and smallest viable correction. Style preferences do not enter the finding set.
+Retrieve external evidence only for one named current or version-sensitive claim that can change a criterion verdict, finding, remediation, or validation gate:
 
-**Gate:** Every criterion is accounted for, the epic definition of done is assessed, and every retained finding is confirmed by local evidence.
+| Need | Route |
+|---|---|
+| Repository behavior or cross-module flow | Targeted local inspection |
+| Exact API, SDK, framework, CLI, or platform contract | Official documentation for the implicated version |
+| Current advisory, standard, or external behavior | Current primary-source web evidence |
 
-## Phase 3 - REMEDIATE
+Use one route per question and stop when the claim is resolved. Record the supported fact, source pointer, and review impact. External evidence must not rewrite the product outcome, non-goals, or acceptance criteria without explicit user authority. Do not launch generic research.
 
-1. Consolidate confirmed findings and failed criteria by affected story and shared integration point.
-2. Apply one coherent remediation pass for all `CRITICAL`, `HIGH`, and `MUST_FIX` findings. Apply `MEDIUM` or `SHOULD_FIX` only when the change is directly in scope, low-risk, and has a clear proof oracle.
-3. Preserve the epic boundary and unrelated work. When a correction requires an irreversible product decision, destructive migration, or architecture expansion absent from the PRD, leave the affected story unresolved and record the decision blocker.
-4. Inspect every patched line and its immediate callers. Add only directly affected proof to the final gate bundle. Avoid re-running the full audit.
-5. If a mandatory finding survives the pass, stop the correction loop and carry it to STATUS with the attempted fix and exact blocker.
+## Phase 2: AUDIT
 
-**Gate:** No confirmed mandatory finding remains, or every survivor has a concrete blocker and affected story.
+1. Read the complete epic diff once from the baseline. Read full files only where the diff lacks enough context.
+2. Map every acceptance criterion and the epic definition of done to evidence. Use `PASS` only for current proof, `FAIL` for contradicted or missing required behavior, `MANUAL_PROVEN` for an observed manual check, and `MANUAL_PENDING` for a required observation not yet available.
+3. Review cross-story composition in dependency order: shared contracts, state transitions, unhappy paths, regressions, and criteria that work alone but fail together.
+4. Audit only applicable correctness, error handling, tests, performance cliffs, dependencies, and security boundaries.
+5. Classify each locally supported issue:
+   - `BLOCKING`: violates a criterion, definition of done, correctness or security invariant, or creates a concrete regression.
+   - `NON_BLOCKING`: confirmed in-scope improvement that does not affect certification.
+   - `OUTSIDE_EPIC`: valid observation without authority to change this epic.
+6. Require each finding to include `file:line`, affected criterion or outcome, concrete failure path, and smallest complete correction. Deduplicate findings by root cause. Ignore style preferences and unsupported speculation.
+7. For DEEP only, use at most one fresh read-only reviewer when a named high-risk axis justifies independent context. Choose correctness or security. Supply the epic contract, diff, named axis, and minimum context. Validate every returned finding directly against local code before retaining it.
 
-## Phase 4 - VERIFY
+**Gate:** Every criterion is accounted for and every retained finding has local evidence.
 
-Run one consolidated gate bundle after remediation. Use the smallest complete bundle in this order:
+## Phase 3: REMEDIATE
+
+1. Consolidate confirmed findings by root cause, affected story, and shared integration point.
+2. Apply one coherent repair pass for all `BLOCKING` findings. Apply `NON_BLOCKING` changes only when they are directly in scope, low-risk, and have a clear proof oracle.
+3. Preserve unrelated work and product intent. Leave the affected criterion unresolved when correction requires an unapproved irreversible decision, destructive migration, or architecture expansion.
+4. Add or update regression tests for mechanically testable defects. Inspect every patched line and its immediate callers.
+5. If a repair fails, make one targeted alternate attempt based on new evidence. If the same cause survives two distinct approaches, record the exact blocker and stop repairing that path.
+6. Do not rerun the complete audit. Recheck the repaired failure paths and update the evidence map.
+
+**Gate:** No confirmed blocking finding remains without a concrete blocker.
+
+## Phase 4: VERIFY/STATUS
+
+After the last code change, run one coherent final validation bundle:
 
 1. Explicit PRD quality gates applicable to the epic surface.
-2. Acceptance tests proving changed behavior and cross-story integration.
-3. One configured type, build, lint, or format command only when it proves something not already covered.
-4. A full suite only when the PRD requires it, the epic changes a shared/public contract, or DEEP regression scope cannot be bounded.
-5. A supply-chain check only when a manifest changed and the project already configures it.
+2. Acceptance and regression tests for every child story.
+3. Cross-story and integration tests for shared contracts.
+4. Configured type, build, lint, and format checks that apply to changed files and are not subsumed by an aggregate project command.
+5. The relevant full suite when required by the PRD, the profile is DEEP, a public contract changed, or regression scope cannot be bounded.
+6. Existing security or supply-chain checks when manifests, dependencies, trust boundaries, or sensitive behavior changed.
 
-Prefer aggregate project scripts and skip commands they subsume. Respect the profile budget unless explicit non-overlapping PRD gates exceed it; then run the required gates and record why.
+If validation fails, fix the specific cause, inspect the repair, rerun affected checks, then produce the final bundle required by the resulting state. Only evidence from the successful bundle after the last change certifies the epic.
 
-When a command fails, correct the specific cause and rerun only that command plus directly affected acceptance tests. Rerun the full bundle only when the correction changes a shared contract or test infrastructure. After the same cause fails twice, change approach once and stop if unresolved. Record exact commands and results. Mark manual criteria as manual.
+Then:
 
-**Gate:** Every criterion is proven, manual, or unresolved; every required command has an honest result.
+1. Finalize every criterion as `PASS`, `FAIL`, `MANUAL_PROVEN`, or `MANUAL_PENDING`.
+2. Confirm the final diff contains only scoped epic work and preserves unrelated changes.
+3. Set `reviewed_at` using repository conventions for every fully audited, non-cancelled child.
+4. Set a story to `DONE` only when every criterion is `PASS` or `MANUAL_PROVEN`, required gates pass, and no blocking finding remains. Use `IN_REVIEW` for pending manual proof or actionable correction, and `BLOCKED` for external dependencies, missing irreversible decisions, or repeated technical failure.
+5. Downgrade a previously `DONE` story when current evidence disproves completion. Preserve a valid existing `completed_at`; set it for newly completed stories.
+6. Recalculate story counters, epic status, and PRD status. The epic is `DONE` only when every child is `DONE` or `CANCELLED`.
+7. Save and validate the status data, then return a compact receipt: epic and profile, per-story and epic verdicts, criterion evidence, fixed findings, final commands and results, status changes, manual proof, and blockers.
 
-## Phase 5 - STATUS
+## Failure Handling
 
-Reuse the Proof Ledger instead of rereading the epic or rerunning checks.
-
-1. Set `reviewed_at` to the current date for every reviewed, non-cancelled child story.
-2. Set a story to `DONE` only when all its criteria are proven, required gates pass, and no mandatory finding or manual verification remains. Set `IN_REVIEW` when implementation exists but required manual proof or an actionable correction remains. Use `BLOCKED` when an external dependency, missing irreversible decision, or repeated technical failure prevents further work. A previously `DONE` story may return to `IN_REVIEW` or `BLOCKED` when the audit disproves completion.
-3. Set `completed_at` for newly completed stories and preserve existing completion dates when the verdict remains valid.
-4. Recalculate `stories_done`, epic status, and PRD status. Set the epic to `DONE` only when all children are `DONE` or `CANCELLED`.
-5. Save the adjacent status JSON. Produce one compact receipt containing: epic and profile, per-story verdicts, epic definition-of-done verdict, confirmed and fixed findings, acceptance evidence, commands and results, status changes, manual proof, and blockers.
-
-**Gate:** The status tracker and receipt describe the same evidence and unresolved work.
-
-## Error Handling
-
-| Error | Action |
+| Scenario | Action |
 |---|---|
-| PRD not found | Infer from the current directory or fail with the attempted paths |
-| Explicit epic ID not found | Fail with the requested ID and available epic IDs |
-| No eligible unreviewed epic | Report the status evidence and stop |
-| Epic already reviewed | Report the existing evidence and stop unless an explicit epic ID requests re-review |
-| No reviewable diff | Report the baseline and mapping evidence; do not infer implementation from status alone |
-| Ambiguous cross-epic diff | Report ambiguous files and require a narrower base or isolated branch |
-| Evidence helper fails | Continue from sufficient local evidence or mark the affected claim unverified |
-| Verification fails twice for the same cause | Change approach once, then stop and mark affected stories `BLOCKED` |
+| PRD or epic not found | Inspect repository conventions and report attempted paths or available IDs |
+| No eligible or reviewable epic | Report the status and baseline evidence; do not infer implementation from the tracker |
+| Diff cannot be isolated | Report the ambiguous files and require a narrower base or isolated branch |
+| Required external evidence is unavailable | Use one official fallback route; if unresolved, mark the claim unverified |
+| Same cause survives two distinct repair approaches | Mark affected criteria and stories `BLOCKED` |
+| Required manual or external proof is unavailable | Preserve truthful `MANUAL_PENDING` or `BLOCKED` state |
+| Epic is already reviewed | Stop unless re-review or an explicit epic was requested |
+
+## Done When
+
+- Every child criterion and the epic definition of done have current evidence.
+- Every retained finding is locally confirmed and classified.
+- The complete final validation bundle passes after the last code change.
+- The status tracker matches the evidence and unresolved work.
+- No manual proof, blocker, unrelated change, or residual uncertainty is hidden.
 
 ## Constraints
 
-- **Always:** Preserve the epic boundary, review child stories in dependency order, map every criterion to evidence, validate helper findings locally, remediate before one consolidated verification pass, and roll up story, epic, and PRD status honestly.
-- **Never:** Run a complete pipeline per story, review unrelated branch changes, treat status as implementation proof, launch helpers for FAST, launch generic research, install tools, invent acceptance evidence, mark manual proof as automated, commit, or push.
+- Preserve the epic boundary, dependency order, repository conventions, and unrelated user work.
+- Prefer local evidence and deterministic checks over model assertions.
+- Never treat tracker status as implementation proof, weaken tests, fabricate findings, or mark pending manual proof as complete.
+- Never commit, push, publish, perform destructive external actions, or expand product scope without explicit authorization.
 
 ## Examples
 
