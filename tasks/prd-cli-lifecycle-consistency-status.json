@@ -3,7 +3,7 @@
     "file": "tasks/prd-cli-lifecycle-consistency.md",
     "title": "Cohérence du cycle de vie Arthur Skills",
     "created_at": "2026-07-30",
-    "status": "IN_PROGRESS"
+    "status": "DONE"
   },
   "epics": [
     {
@@ -25,10 +25,10 @@
     {
       "id": "EP-003",
       "title": "Commit sûr et preuve de non-régression",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 2,
-      "stories_done": 0
+      "stories_done": 2
     }
   ],
   "stories": [
@@ -134,7 +134,7 @@
       "id": "US-008",
       "title": "Revalider chaque claim avant le receipt commit",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
@@ -142,15 +142,15 @@
         "US-004",
         "US-006"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-30",
+      "completed_at": "2026-07-30",
+      "reviewed_at": "2026-07-30"
     },
     {
       "id": "US-009",
       "title": "Prouver par contrats la parité et les états mixtes",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
@@ -159,9 +159,9 @@
         "US-007",
         "US-008"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-30",
+      "completed_at": "2026-07-30",
+      "reviewed_at": "2026-07-30"
     }
   ]
 }
