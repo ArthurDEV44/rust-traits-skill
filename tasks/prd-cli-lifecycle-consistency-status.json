@@ -17,10 +17,10 @@
     {
       "id": "EP-002",
       "title": "Décision unique et convergence observable",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     },
     {
       "id": "EP-003",
@@ -77,58 +77,58 @@
       "id": "US-004",
       "title": "Construire une LifecycleDecision canonique",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-001",
         "US-003"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-30",
+      "completed_at": "2026-07-30",
+      "reviewed_at": "2026-07-30"
     },
     {
       "id": "US-005",
       "title": "Router plan, dry-run, UI et apply vers la même décision",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-004"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-30",
+      "completed_at": "2026-07-30",
+      "reviewed_at": "2026-07-30"
     },
     {
       "id": "US-006",
       "title": "Représenter et committer la convergence du receipt",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-004"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-30",
+      "completed_at": "2026-07-30",
+      "reviewed_at": "2026-07-30"
     },
     {
       "id": "US-007",
       "title": "Exposer provenance et diagnostics actionnables",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-004"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-30",
+      "completed_at": "2026-07-30",
+      "reviewed_at": "2026-07-30"
     },
     {
       "id": "US-008",
