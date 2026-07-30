@@ -9,12 +9,12 @@ use std::path::Path;
 use arthur_skills::adoption::{self, LegacyImportPlan};
 use arthur_skills::catalog::{AssetKind, Catalog, Provider as CatalogProvider};
 use arthur_skills::lifecycle::{
-    LifecycleError, LifecycleIntent, LifecycleNoticeCode, LifecycleTransition,
-    prepare_import_transition, prepare_lifecycle_transition, prepare_reconciliation_transition,
+    LegacyEvidence, LifecycleDecision, LifecycleNoticeCode, LifecycleRequest, UNSAFE_CONTAINER,
+    decide,
 };
 use arthur_skills::operations::{operations_for_import, operations_for_plan};
 use arthur_skills::plan::{
-    MATCHING_UNMANAGED_WITHOUT_PROOF, OwnershipBasis, OwnershipClaim, PlanAction,
+    MATCHING_UNMANAGED_WITHOUT_PROOF, OwnershipBasis, OwnershipClaim, PlanAction, PlanReason,
 };
 use arthur_skills::provider::{ProviderId, ResolvedRoots, resolve_roots_from};
 use arthur_skills::receipt::{OwnedAsset, OwnedAssetKind, Receipt, RetainedUnmanagedAsset};
@@ -59,7 +59,7 @@ fn roots(home: &TempDir, providers: &[ProviderId]) -> Result<ResolvedRoots, Box<
 
 fn apply(
     roots: &ResolvedRoots,
-    transition: &LifecycleTransition,
+    transition: &LifecycleDecision,
     transaction_id: &str,
 ) -> TestResult {
     let operations =
@@ -76,15 +76,15 @@ fn install_both(
     catalog: &Catalog,
     roots: &ResolvedRoots,
     transaction_id: &str,
-) -> Result<LifecycleTransition, Box<dyn Error>> {
-    let transition = prepare_lifecycle_transition(
+) -> Result<LifecycleDecision, Box<dyn Error>> {
+    let transition = decide(
         catalog,
         roots,
         None,
-        &LifecycleIntent::Install {
+        &LifecycleRequest::Reconcile {
             providers: vec![ProviderId::Claude, ProviderId::Codex],
         },
-        None,
+        &LegacyEvidence::Absent,
     )?;
     assert!(transition.plan.applicable);
     apply(roots, &transition, transaction_id)?;
@@ -264,14 +264,14 @@ fn homonyms_require_adoption_and_owned_drift_blocks_reconciliation() -> TestResu
     let collision = collision_roots.canonical_skills.join("baseline-ui");
     fs::create_dir_all(&collision)?;
     set_directory_mode(&collision, 0o755)?;
-    let blocked = prepare_lifecycle_transition(
+    let blocked = decide(
         &catalog,
         &collision_roots,
         None,
-        &LifecycleIntent::Install {
+        &LifecycleRequest::Reconcile {
             providers: vec![ProviderId::Codex],
         },
-        None,
+        &LegacyEvidence::Absent,
     )?;
     assert!(!blocked.plan.applicable);
     assert!(
@@ -291,14 +291,14 @@ fn homonyms_require_adoption_and_owned_drift_blocks_reconciliation() -> TestResu
     write_legacy_lock(&collision_roots, &["baseline-ui"])?;
     let legacy = legacy_import_plan(&catalog, &collision_roots)?
         .ok_or("the legacy lock proves no catalog skill")?;
-    let proven = prepare_lifecycle_transition(
+    let proven = decide(
         &catalog,
         &collision_roots,
         None,
-        &LifecycleIntent::Install {
+        &LifecycleRequest::Reconcile {
             providers: vec![ProviderId::Codex],
         },
-        Some(&legacy),
+        &LegacyEvidence::Verified(&legacy),
     )?;
     let adoptable = proven
         .plan
@@ -325,14 +325,14 @@ fn homonyms_require_adoption_and_owned_drift_blocks_reconciliation() -> TestResu
     let installed = install_both(&catalog, &roots, "drift-install")?;
     let managed_file = roots.canonical_skills.join("baseline-ui/SKILL.md");
     fs::write(&managed_file, b"local edit")?;
-    let drifted = prepare_lifecycle_transition(
+    let drifted = decide(
         &catalog,
         &roots,
         Some(&installed.receipt),
-        &LifecycleIntent::Install {
+        &LifecycleRequest::Reconcile {
             providers: vec![ProviderId::Claude, ProviderId::Codex],
         },
-        None,
+        &LegacyEvidence::Absent,
     )?;
     assert!(!drifted.plan.applicable);
     assert!(
@@ -350,14 +350,14 @@ fn homonyms_require_adoption_and_owned_drift_blocks_reconciliation() -> TestResu
         .find(|asset| asset.destination == managed_file)
         .ok_or("managed file ownership is missing")?;
     owned.hash = Some(hash_bytes(old_bytes));
-    let update = prepare_lifecycle_transition(
+    let update = decide(
         &catalog,
         &roots,
         Some(&prior),
-        &LifecycleIntent::Install {
+        &LifecycleRequest::Reconcile {
             providers: vec![ProviderId::Claude, ProviderId::Codex],
         },
-        None,
+        &LegacyEvidence::Absent,
     )?;
     assert!(update.plan.applicable);
     assert!(
@@ -400,8 +400,15 @@ fn import_and_reconciliation_repair_catalog_assets_without_claiming_personal_ass
     let legacy = legacy_import_plan(&catalog, &import_roots)?
         .ok_or("the legacy lock proves no catalog skill")?;
 
-    let imported =
-        prepare_import_transition(&catalog, &import_roots, &ProviderId::ALL, Some(&legacy))?;
+    let imported = decide(
+        &catalog,
+        &import_roots,
+        None,
+        &LifecycleRequest::Import {
+            providers: ProviderId::ALL.to_vec(),
+        },
+        &LegacyEvidence::Verified(&legacy),
+    )?;
     assert!(
         imported.plan.applicable,
         "{:?}",
@@ -452,26 +459,60 @@ fn import_and_reconciliation_repair_catalog_assets_without_claiming_personal_ass
     let committed = Receipt::decode(&fs::read(&import_roots.receipt_path)?)?;
     assert!(committed.owned_asset(&personal).is_none());
 
+    // A managed asset that differs from its receipt proof and from the catalog is
+    // preserved: reconciliation blocks instead of planning a destructive update.
     let update_home = tempfile::tempdir()?;
     let update_roots = roots(&update_home, &ProviderId::ALL)?;
     let installed = install_both(&catalog, &update_roots, "prepare-update")?;
     let drifted_agent = update_home.path().join(".codex/agents/agent-explorer.toml");
+    let original_agent = fs::read(&drifted_agent)?;
     fs::write(&drifted_agent, b"locally misaligned")?;
-    let updated = prepare_reconciliation_transition(
+    let updated = decide(
         &catalog,
         &update_roots,
-        &installed.receipt,
-        &ProviderId::ALL,
-        None,
+        Some(&installed.receipt),
+        &LifecycleRequest::Reconcile {
+            providers: ProviderId::ALL.to_vec(),
+        },
+        &LegacyEvidence::Absent,
     )?;
-    assert!(updated.plan.applicable);
+    assert!(!updated.plan.applicable);
+    assert!(updated.plan.entries.iter().any(|entry| {
+        entry.destination == drifted_agent
+            && entry.action == PlanAction::Drifted
+            && entry.reason == PlanReason::ManagedPathDrifted
+    }));
     assert!(
-        updated.plan.entries.iter().any(|entry| {
-            entry.destination == drifted_agent && entry.action == PlanAction::Update
-        })
+        updated
+            .plan
+            .operations
+            .iter()
+            .all(|operation| operation.destination != drifted_agent)
     );
-    apply(&update_roots, &updated, "reconcile-existing")?;
-    assert_ne!(fs::read(&drifted_agent)?, b"locally misaligned");
+    assert!(
+        operations_for_plan(
+            &updated.plan,
+            &update_roots,
+            &updated.receipt,
+            "reconcile-existing",
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(&drifted_agent)?, b"locally misaligned");
+
+    // Restoring the recorded proof makes the same request converge again.
+    fs::write(&drifted_agent, &original_agent)?;
+    let converged = decide(
+        &catalog,
+        &update_roots,
+        Some(&installed.receipt),
+        &LifecycleRequest::Reconcile {
+            providers: ProviderId::ALL.to_vec(),
+        },
+        &LegacyEvidence::Absent,
+    )?;
+    assert!(converged.plan.applicable);
+    assert!(converged.is_current());
     Ok(())
 }
 
@@ -482,12 +523,12 @@ fn provider_uninstall_preserves_references_and_full_uninstall_releases_drift() -
     let catalog = Catalog::load()?;
     let installed = install_both(&catalog, &roots, "lifecycle-install")?;
 
-    let codex_only_removal = prepare_lifecycle_transition(
+    let codex_only_removal = decide(
         &catalog,
         &roots,
         Some(&installed.receipt),
-        &LifecycleIntent::UninstallProvider(ProviderId::Codex),
-        None,
+        &LifecycleRequest::UninstallProvider(ProviderId::Codex),
+        &LegacyEvidence::Absent,
     )?;
     assert!(codex_only_removal.plan.applicable);
     assert!(codex_only_removal.plan.entries.iter().all(|entry| {
@@ -497,12 +538,12 @@ fn provider_uninstall_preserves_references_and_full_uninstall_releases_drift() -
         notice.code == LifecycleNoticeCode::CodexIntegrationRemovedSkillsRemainVisible
     }));
 
-    let claude_removed = prepare_lifecycle_transition(
+    let claude_removed = decide(
         &catalog,
         &roots,
         Some(&installed.receipt),
-        &LifecycleIntent::UninstallProvider(ProviderId::Claude),
-        None,
+        &LifecycleRequest::UninstallProvider(ProviderId::Claude),
+        &LegacyEvidence::Absent,
     )?;
     assert!(claude_removed.plan.applicable);
     assert!(claude_removed.plan.entries.iter().all(|entry| {
@@ -537,12 +578,12 @@ fn provider_uninstall_preserves_references_and_full_uninstall_releases_drift() -
     fs::write(&drifted_agent, b"local edit")?;
     fs::remove_file(&missing_agent)?;
     fs::write(&personal_agent, b"personal")?;
-    let uninstall_all = prepare_lifecycle_transition(
+    let uninstall_all = decide(
         &catalog,
         &roots,
         Some(&claude_removed.receipt),
-        &LifecycleIntent::UninstallAll,
-        None,
+        &LifecycleRequest::UninstallAll,
+        &LegacyEvidence::Absent,
     )?;
     assert!(uninstall_all.plan.applicable);
     assert!(uninstall_all.plan.entries.iter().any(|entry| {
@@ -637,14 +678,14 @@ fn non_utf8_foreign_entry_blocks_uninstall_before_mutation() -> TestResult {
     let home = tempfile::tempdir()?;
     let roots = roots(&home, &[ProviderId::Codex])?;
     let catalog = Catalog::load()?;
-    let installed = prepare_lifecycle_transition(
+    let installed = decide(
         &catalog,
         &roots,
         None,
-        &LifecycleIntent::Install {
+        &LifecycleRequest::Reconcile {
             providers: vec![ProviderId::Codex],
         },
-        None,
+        &LegacyEvidence::Absent,
     )?;
     apply(&roots, &installed, "non-utf8-install")?;
 
@@ -653,12 +694,12 @@ fn non_utf8_foreign_entry_blocks_uninstall_before_mutation() -> TestResult {
         .join(".codex/agents")
         .join(std::ffi::OsString::from_vec(vec![0xff, 0xfe]));
     fs::write(&foreign, b"foreign")?;
-    let uninstall = prepare_lifecycle_transition(
+    let uninstall = decide(
         &catalog,
         &roots,
         Some(&installed.receipt),
-        &LifecycleIntent::UninstallAll,
-        None,
+        &LifecycleRequest::UninstallAll,
+        &LegacyEvidence::Absent,
     )?;
     assert!(!uninstall.plan.applicable);
     assert!(
@@ -687,18 +728,24 @@ fn provider_container_type_conflicts_block_planning() -> TestResult {
         let conflict = home.path().join(relative);
         fs::create_dir_all(conflict.parent().ok_or("conflict has no parent")?)?;
         fs::write(&conflict, b"wrong type")?;
-        assert!(matches!(
-            prepare_lifecycle_transition(
-                &catalog,
-                &roots,
-                None,
-                &LifecycleIntent::Install {
-                    providers: vec![provider],
-                },
-                None,
-            ),
-            Err(LifecycleError::UnsafeContainer { .. })
-        ));
+        let blocked = decide(
+            &catalog,
+            &roots,
+            None,
+            &LifecycleRequest::Reconcile {
+                providers: vec![provider],
+            },
+            &LegacyEvidence::Absent,
+        )?;
+        assert!(!blocked.applicable());
+        assert!(blocked.plan.operations.is_empty());
+        assert!(
+            blocked
+                .plan
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == UNSAFE_CONTAINER)
+        );
     }
     Ok(())
 }
@@ -712,12 +759,12 @@ fn uninstall_failure_rolls_back_assets_and_receipt_together() -> TestResult {
     let before_receipt = fs::read(&roots.receipt_path)?;
     let claude_agent = home.path().join(".claude/agents/agent-docs.md");
     let before_agent = fs::read(&claude_agent)?;
-    let transition = prepare_lifecycle_transition(
+    let transition = decide(
         &catalog,
         &roots,
         Some(&installed.receipt),
-        &LifecycleIntent::UninstallProvider(ProviderId::Claude),
-        None,
+        &LifecycleRequest::UninstallProvider(ProviderId::Claude),
+        &LegacyEvidence::Absent,
     )?;
     let operations = operations_for_plan(
         &transition.plan,

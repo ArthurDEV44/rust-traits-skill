@@ -6,8 +6,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::plan::{
-    DiagnosticSeverity as PlanSeverity, MATCHING_UNMANAGED_WITHOUT_PROOF, Owner, Plan, PlanAction,
-    PlanEntry,
+    DiagnosticSeverity as PlanSeverity, LEGACY_ENTRY_DOES_NOT_MATCH_CATALOG,
+    MATCHING_UNMANAGED_WITHOUT_PROOF, Owner, OwnershipBasis, Plan, PlanAction, PlanEntry,
+    PlanReason, PlanSummary, action_key,
 };
 use crate::platform::path_key;
 use crate::provider::{ENVIRONMENT_EXIT_CODE, ProviderId};
@@ -40,6 +41,8 @@ pub struct OutputDiagnostic {
     pub code: String,
     pub severity: OutputSeverity,
     pub message: String,
+    /// Legacy entry identity behind the diagnostic, when one produced it.
+    pub source_id: Option<String>,
     pub path_utf8: Option<String>,
     pub path_bytes_hex: Option<String>,
     pub remediation: Option<String>,
@@ -55,6 +58,7 @@ impl OutputDiagnostic {
             code: code.into(),
             severity: OutputSeverity::Error,
             message: message.into(),
+            source_id: None,
             path_utf8: None,
             path_bytes_hex: None,
             remediation,
@@ -76,6 +80,12 @@ pub struct OutputOperation {
     pub destination_bytes_hex: Option<String>,
     pub owner: Owner,
     pub reason: String,
+    /// Closed reason code behind the entry, stable across releases.
+    pub reason_code: PlanReason,
+    /// Proof that allows this destination to enter the receipt.
+    pub ownership_basis: OwnershipBasis,
+    /// Legacy `source_id` when a verified lock entry proves the destination.
+    pub source_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,7 +110,10 @@ impl From<&PlanEntry> for OutputOperation {
             destination_utf8,
             destination_bytes_hex,
             owner: entry.owner,
-            reason: entry.reason.clone(),
+            reason: entry.message().to_owned(),
+            reason_code: entry.reason,
+            ownership_basis: entry.ownership_basis(),
+            source_id: entry.ownership.source_id().cloned(),
         }
     }
 }
@@ -143,6 +156,7 @@ pub(crate) fn asset_changes<'a>(
 
 pub(crate) const fn pending_action_label(action: PlanAction) -> &'static str {
     match action {
+        PlanAction::WriteReceipt => "Metadata",
         PlanAction::Create => "Restore",
         PlanAction::Update => "Update",
         PlanAction::Remove => "Remove",
@@ -153,6 +167,42 @@ pub(crate) const fn pending_action_label(action: PlanAction) -> &'static str {
         PlanAction::RecoveryRequired => "Recover",
         PlanAction::Noop => "Keep",
     }
+}
+
+/// Text lines that name every provenance family a decision found.
+///
+/// Both counts stay separate and no line points at `adopt` unless a verified
+/// candidate exists, so a matching unmanaged path always reads as unowned.
+pub(crate) fn provenance_lines(summary: &PlanSummary, receipt_convergence: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if summary.verified_legacy_candidates > 0 {
+        lines.push(format!(
+            "Adoptable  {} verified legacy {}; run adopt to transfer {}",
+            summary.verified_legacy_candidates,
+            plural(
+                summary.verified_legacy_candidates,
+                "candidate",
+                "candidates"
+            ),
+            plural(summary.verified_legacy_candidates, "it", "them"),
+        ));
+    }
+    if summary.matching_unmanaged > 0 {
+        lines.push(format!(
+            "Unowned    {} matching unmanaged {} without ownership proof; move or remove {}, then run plan again",
+            summary.matching_unmanaged,
+            plural(summary.matching_unmanaged, "path", "paths"),
+            plural(summary.matching_unmanaged, "it", "them"),
+        ));
+    }
+    if receipt_convergence {
+        lines.push("Metadata   installation metadata will be reconciled".to_owned());
+    }
+    lines
+}
+
+const fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
 }
 
 pub(crate) const fn completed_action_label(action: PlanAction) -> &'static str {
@@ -170,7 +220,9 @@ fn classify_asset(source: &str) -> Option<(String, String, u8)> {
         .strip_prefix("activation:claude:")
         .map_or((source, false), |source| (source, true));
     let source = source.strip_prefix("directory:").unwrap_or(source);
-    if source.starts_with("container:") {
+    // Containers and the receipt are not user-facing assets; the receipt is
+    // reported as its own metadata line instead.
+    if source.starts_with("container:") || source.starts_with("receipt:") {
         return None;
     }
     if let Some(path) = source.strip_prefix("skills/") {
@@ -316,6 +368,7 @@ impl Envelope {
                     PlanSeverity::Warning => OutputSeverity::Warning,
                 },
                 message: diagnostic.message.clone(),
+                source_id: diagnostic.source_id.clone(),
                 path_utf8: diagnostic.path_utf8.clone(),
                 path_bytes_hex: diagnostic.path_bytes_hex.clone(),
                 remediation: Some(plan_remediation(&diagnostic.code).to_owned()),
@@ -343,6 +396,9 @@ impl Envelope {
 fn plan_remediation(code: &str) -> &'static str {
     if code == MATCHING_UNMANAGED_WITHOUT_PROOF {
         return "Move or remove this matching unmanaged path, then run plan again.";
+    }
+    if code == LEGACY_ENTRY_DOES_NOT_MATCH_CATALOG {
+        return "Move or remove this legacy path, then run plan again; adopt only transfers entries that match the bundled catalog.";
     }
     "Resolve the reported path before applying this plan."
 }
@@ -436,10 +492,12 @@ fn write_human_with_detail(
         }
         if envelope.command.is_some() {
             for operation in &envelope.operations {
+                // The human line uses the same public action key as the JSON, so
+                // the two surfaces can never drift apart.
                 writeln!(
                     output,
-                    "{:?} {} ({})",
-                    operation.action,
+                    "{} {} ({})",
+                    action_key(operation.action),
                     operation
                         .destination_utf8
                         .as_deref()
@@ -527,15 +585,17 @@ fn write_upstream(envelope: &Envelope, output: &mut impl Write) -> io::Result<()
 }
 
 pub(crate) fn compact_summary(envelope: &Envelope) -> Vec<String> {
-    const ACTIONS: [(&str, &str); 9] = [
+    const ACTIONS: [(&str, &str); 11] = [
         ("create", "created"),
         ("update", "updated"),
         ("remove", "removed"),
         ("adoptable", "adoptable"),
+        ("matching_unmanaged", "matching unmanaged"),
         ("drifted", "drifted"),
         ("conflict", "conflicting"),
         ("retained_unmanaged", "retained"),
         ("recovery_required", "requiring recovery"),
+        ("write_receipt", "metadata reconciled"),
         ("noop", "unchanged"),
     ];
     ACTIONS
@@ -550,13 +610,24 @@ pub(crate) fn compact_summary(envelope: &Envelope) -> Vec<String> {
         .collect()
 }
 
+/// Projects the decision summary and keeps the two collision families apart, so
+/// a verified candidate is never counted as a foreign path.
 fn summarize(plan: &Plan) -> BTreeMap<String, usize> {
-    let mut summary = BTreeMap::new();
-    for entry in &plan.entries {
-        let action = format!("{:?}", entry.action).to_ascii_lowercase();
-        *summary.entry(action).or_insert(0) += 1;
+    let PlanSummary {
+        mut actions,
+        verified_legacy_candidates,
+        matching_unmanaged,
+    } = plan.summary();
+    if verified_legacy_candidates > 0 {
+        actions.insert(
+            "verified_legacy_candidates".to_owned(),
+            verified_legacy_candidates,
+        );
     }
-    summary
+    if matching_unmanaged > 0 {
+        actions.insert("matching_unmanaged".to_owned(), matching_unmanaged);
+    }
+    actions
 }
 
 pub fn path_fields(path: &Path) -> (Option<String>, Option<String>) {
@@ -591,8 +662,8 @@ mod tests {
         write_human, write_human_compact, write_json,
     };
     use crate::plan::{
-        Diagnostic, DiagnosticSeverity, Owner, OwnershipClaim, Plan, PlanAction, PlanEntry,
-        PlannedMutation,
+        Diagnostic, DiagnosticSeverity, Owner, OwnershipBasis, OwnershipClaim, Plan, PlanAction,
+        PlanEntry, PlanReason, PlannedMutation,
     };
 
     #[test]
@@ -633,7 +704,7 @@ mod tests {
                 source: "skill:test".to_owned(),
                 destination: non_utf8.clone(),
                 owner: Owner::Unmanaged,
-                reason: "foreign destination".to_owned(),
+                reason: PlanReason::UnmanagedConflict,
                 ownership: OwnershipClaim::None,
             }],
             operations: Vec::<PlannedMutation>::new(),
@@ -642,6 +713,7 @@ mod tests {
                     code: "unsafe_path".to_owned(),
                     severity: DiagnosticSeverity::Error,
                     message: "unsafe destination".to_owned(),
+                    source_id: None,
                     path_utf8: None,
                     path_bytes_hex: Some("ff".to_owned()),
                 },
@@ -649,6 +721,7 @@ mod tests {
                     code: "notice".to_owned(),
                     severity: DiagnosticSeverity::Warning,
                     message: "review destination".to_owned(),
+                    source_id: None,
                     path_utf8: Some("/tmp/path".to_owned()),
                     path_bytes_hex: None,
                 },
@@ -667,7 +740,10 @@ mod tests {
             destination_utf8: None,
             destination_bytes_hex: None,
             owner: Owner::ArthurWorkflow,
-            reason: "missing display path".to_owned(),
+            reason: PlanReason::DestinationAbsent.message().to_owned(),
+            reason_code: PlanReason::DestinationAbsent,
+            ownership_basis: OwnershipBasis::None,
+            source_id: None,
         });
         envelope.data = Value::String("done".to_owned());
         let mut output = Vec::new();
@@ -689,7 +765,7 @@ mod tests {
                 source: "skills/example/SKILL.md".to_owned(),
                 destination: PathBuf::from("/home/user/.agents/skills/example/SKILL.md"),
                 owner: Owner::Unmanaged,
-                reason: "matching unmanaged asset has no ownership proof".to_owned(),
+                reason: PlanReason::MatchingUnmanagedWithoutProof,
                 ownership: OwnershipClaim::None,
             }],
             operations: Vec::<PlannedMutation>::new(),
@@ -697,6 +773,7 @@ mod tests {
                 code: MATCHING_UNMANAGED_WITHOUT_PROOF.to_owned(),
                 severity: DiagnosticSeverity::Error,
                 message: "matching unmanaged asset has no ownership proof".to_owned(),
+                source_id: None,
                 path_utf8: Some("/home/user/.agents/skills/example/SKILL.md".to_owned()),
                 path_bytes_hex: None,
             }],
@@ -728,13 +805,17 @@ mod tests {
             destination_utf8: Some("/home/user/.agents/skills/test".to_owned()),
             destination_bytes_hex: None,
             owner: Owner::ArthurWorkflow,
-            reason: "managed path is eligible for a verified update".to_owned(),
+            reason: PlanReason::EligibleUpdate.message().to_owned(),
+            reason_code: PlanReason::EligibleUpdate,
+            ownership_basis: OwnershipBasis::Receipt,
+            source_id: Some("skills/example/SKILL.md".to_owned()),
         });
         envelope.data = serde_json::json!({ "applied": true, "result": "committed" });
         envelope.diagnostics.push(OutputDiagnostic {
             code: "codex_uses_implicit_skills".to_owned(),
             severity: OutputSeverity::Warning,
             message: "Codex reads shared skills directly.".to_owned(),
+            source_id: None,
             path_utf8: None,
             path_bytes_hex: None,
             remediation: None,

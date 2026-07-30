@@ -14,7 +14,7 @@ use ratatui::{Frame, TerminalOptions, Viewport};
 use crate::app::{Action, App, Outcome, Provider, Step};
 use crate::output::{
     AssetChange, Envelope, OutputSeverity, asset_changes, compact_summary, completed_action_label,
-    pending_action_label,
+    pending_action_label, provenance_lines,
 };
 use crate::plan::PlanAction;
 use crate::transaction::{SIGINT_EXIT_CODE, SignalFlags};
@@ -641,6 +641,11 @@ fn review_text(app: &App, colors: bool) -> Text<'static> {
                 assessment.legacy_skills_to_import, assessment.legacy_skills_to_clean
             )));
         }
+        lines.extend(
+            provenance_lines(&review.summary, review.receipt_convergence)
+                .into_iter()
+                .map(Line::from),
+        );
         let changes = asset_changes(
             review
                 .groups
@@ -674,7 +679,10 @@ fn review_text(app: &App, colors: bool) -> Text<'static> {
         }
         return Text::from(lines);
     }
-    let mut lines = Vec::new();
+    let mut lines = provenance_lines(&review.summary, review.receipt_convergence)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
     for ((root, action), entries) in &review.groups {
         lines.push(Line::from(format!(
             "{action:?} · {}  {root}",
@@ -740,6 +748,7 @@ fn change_action_style(action: PlanAction, colors: bool) -> Style {
     let color = match action {
         PlanAction::Create => Color::Green,
         PlanAction::Update | PlanAction::Adoptable | PlanAction::RetainedUnmanaged => Color::Yellow,
+        PlanAction::WriteReceipt => Color::Cyan,
         PlanAction::Remove
         | PlanAction::Drifted
         | PlanAction::Conflict
@@ -809,7 +818,9 @@ mod tests {
     use crate::app::{Action, App, Provider, Review};
     use crate::lifecycle::{LifecycleNotice, LifecycleNoticeCode};
     use crate::output::{Envelope, OutputDiagnostic, OutputOperation, OutputSeverity};
-    use crate::plan::{Owner, OwnershipClaim, Plan, PlanAction, PlanEntry};
+    use crate::plan::{
+        Owner, OwnershipBasis, OwnershipClaim, Plan, PlanAction, PlanEntry, PlanReason, PlanSummary,
+    };
     use crate::provider::resolve_roots_from;
     use crate::workflow::{AssetSummary, WorkflowAssessment, WorkflowState};
 
@@ -853,12 +864,16 @@ mod tests {
             destination_utf8: Some("/home/user/.agents/skills/coss/SKILL.md".to_owned()),
             destination_bytes_hex: None,
             owner: Owner::ArthurWorkflow,
-            reason: "managed path needs an update".to_owned(),
+            reason: PlanReason::EligibleUpdate.message().to_owned(),
+            reason_code: PlanReason::EligibleUpdate,
+            ownership_basis: OwnershipBasis::Receipt,
+            source_id: Some("skills/coss/SKILL.md".to_owned()),
         });
         envelope.diagnostics.push(OutputDiagnostic {
             code: "codex_uses_implicit_skills".to_owned(),
             severity: OutputSeverity::Warning,
             message: "Codex reads shared skills directly.".to_owned(),
+            source_id: None,
             path_utf8: None,
             path_bytes_hex: None,
             remediation: None,
@@ -972,6 +987,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut app = App::with_selection(50, &[Provider::Claude, Provider::Codex]);
         app.set_review(Review {
+            summary: PlanSummary::default(),
+            receipt_convergence: false,
             verified_legacy_candidates: 0,
             groups: [(
                 ("/home/user/.agents/skills".to_owned(), PlanAction::Update),
@@ -980,7 +997,7 @@ mod tests {
                     source: "skills/coss/SKILL.md".to_owned(),
                     destination: "/home/user/.agents/skills/coss/SKILL.md".into(),
                     owner: Owner::ArthurWorkflow,
-                    reason: "managed path needs an update".to_owned(),
+                    reason: PlanReason::EligibleUpdate,
                     ownership: OwnershipClaim::None,
                 }],
             )]
@@ -1032,6 +1049,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut app = App::with_selection(50, &[Provider::Claude, Provider::Codex]);
         app.set_review(Review {
+            summary: PlanSummary::default(),
+            receipt_convergence: false,
             verified_legacy_candidates: 0,
             groups: Default::default(),
             applicable: true,
@@ -1092,7 +1111,7 @@ mod tests {
                     .canonical_skills
                     .join(format!("skill-{index}/SKILL.md")),
                 owner: Owner::Unmanaged,
-                reason: "foreign content".to_owned(),
+                reason: PlanReason::UnmanagedConflict,
                 ownership: OwnershipClaim::None,
             })
             .collect::<Vec<_>>();

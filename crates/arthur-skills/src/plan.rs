@@ -17,6 +17,10 @@ pub const PLAN_SCHEMA_VERSION: u16 = 1;
 /// byte yet carries no ownership proof.
 pub const MATCHING_UNMANAGED_WITHOUT_PROOF: &str = "matching_unmanaged_without_proof";
 
+/// Stable diagnostic code for a destination a verified lock entry names while
+/// its content, type, mode or target diverges from the bundled catalog.
+pub const LEGACY_ENTRY_DOES_NOT_MATCH_CATALOG: &str = "legacy_entry_does_not_match_catalog";
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanAction {
@@ -29,6 +33,97 @@ pub enum PlanAction {
     Conflict,
     RetainedUnmanaged,
     RecoveryRequired,
+    /// Control-plane convergence: the projected receipt differs semantically
+    /// from the recorded one, even when every asset already matches.
+    WriteReceipt,
+}
+
+/// Closed reason behind a plan entry.
+///
+/// Every consumer classifies from this code instead of re-inspecting the
+/// filesystem, so a renderer and the executor always agree with the decision
+/// they received.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReason {
+    RootPolicyViolation,
+    DestinationAbsent,
+    ManagedPathMissing,
+    ManagedPathDrifted,
+    AlreadyMatchesDesired,
+    EligibleUpdate,
+    VerifiedLegacyAdoption,
+    MatchingUnmanagedWithoutProof,
+    UnmanagedSymlinkBroken,
+    UnmanagedSymlinkCyclic,
+    UnmanagedSymlinkEscaped,
+    UnmanagedSymlinkDifferentTarget,
+    UnmanagedConflict,
+    FilesystemInspectionFailed,
+    OwnedRootPolicyViolation,
+    OwnedAbsentFromDesired,
+    OwnedDirectoryRetained,
+    OwnedAbsentReleased,
+    OwnedRetainedReleased,
+    OwnedRemovalBlockedByDrift,
+    ReceiptConvergence,
+}
+
+impl PlanReason {
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::RootPolicyViolation => "destination violates the configured root policy",
+            Self::DestinationAbsent => "destination does not exist",
+            Self::ManagedPathMissing => "managed path is missing",
+            Self::ManagedPathDrifted => "managed path differs from its receipt proof",
+            Self::AlreadyMatchesDesired => "managed path already matches the desired state",
+            Self::EligibleUpdate => "managed path is eligible for a verified update",
+            Self::VerifiedLegacyAdoption => "verified legacy entry requires explicit adoption",
+            Self::MatchingUnmanagedWithoutProof => {
+                "matching unmanaged asset has no ownership proof"
+            }
+            Self::UnmanagedSymlinkBroken => "unmanaged symlink is broken",
+            Self::UnmanagedSymlinkCyclic => "unmanaged symlink is cyclic",
+            Self::UnmanagedSymlinkEscaped => {
+                "unmanaged symlink resolves outside the allowed target"
+            }
+            Self::UnmanagedSymlinkDifferentTarget => {
+                "unmanaged symlink targets a different canonical asset"
+            }
+            Self::UnmanagedConflict => "unmanaged path conflicts with the desired asset",
+            Self::FilesystemInspectionFailed => "filesystem inspection failed",
+            Self::OwnedRootPolicyViolation => {
+                "owned destination violates the configured root policy"
+            }
+            Self::OwnedAbsentFromDesired => "owned asset is absent from the desired state",
+            Self::OwnedDirectoryRetained => {
+                "owned directory contains unmanaged content and will be released"
+            }
+            Self::OwnedAbsentReleased => {
+                "owned asset is already absent and its ownership will be released"
+            }
+            Self::OwnedRetainedReleased => {
+                "owned asset is retained and its ownership will be released"
+            }
+            Self::OwnedRemovalBlockedByDrift => {
+                "owned asset cannot be removed because its proof no longer matches"
+            }
+            Self::ReceiptConvergence => "installation metadata will be reconciled",
+        }
+    }
+
+    /// True when the destination is known to be absent from the decision alone.
+    #[must_use]
+    pub const fn is_absent(self) -> bool {
+        matches!(self, Self::DestinationAbsent | Self::ManagedPathMissing)
+    }
+
+    /// True when the destination matches the catalog but carries no proof.
+    #[must_use]
+    pub const fn is_matching_unmanaged(self) -> bool {
+        matches!(self, Self::MatchingUnmanagedWithoutProof)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,6 +370,9 @@ pub enum MutationKind {
     SetMode,
     CreateSymlink,
     RemoveOwnedPath,
+    /// Commits the projected receipt. Its bytes are only final at commit time,
+    /// so the executor rebuilds them from the decision's projected receipt.
+    WriteReceipt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -299,14 +397,38 @@ pub struct PlanEntry {
     pub source: String,
     pub destination: PathBuf,
     pub owner: Owner,
-    pub reason: String,
+    pub reason: PlanReason,
     pub ownership: OwnershipClaim,
 }
 
 impl PlanEntry {
     #[must_use]
+    pub fn new(
+        action: PlanAction,
+        source: impl Into<String>,
+        destination: PathBuf,
+        owner: Owner,
+        reason: PlanReason,
+        ownership: OwnershipClaim,
+    ) -> Self {
+        Self {
+            action,
+            source: source.into(),
+            destination,
+            owner,
+            reason,
+            ownership,
+        }
+    }
+
+    #[must_use]
     pub const fn ownership_basis(&self) -> OwnershipBasis {
         self.ownership.basis()
+    }
+
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        self.reason.message()
     }
 }
 
@@ -322,12 +444,16 @@ pub struct Diagnostic {
     pub code: String,
     pub severity: DiagnosticSeverity,
     pub message: String,
+    /// Legacy `source_id` behind the diagnostic, when a lock entry produced it.
+    pub source_id: Option<String>,
     pub path_utf8: Option<String>,
     pub path_bytes_hex: Option<String>,
 }
 
 impl Diagnostic {
-    fn path_error(code: &str, message: String, path: &Path) -> Self {
+    /// Records a blocking diagnostic with a lossless destination.
+    #[must_use]
+    pub(crate) fn path_error(code: &str, message: String, path: &Path) -> Self {
         let (path_utf8, path_bytes_hex) = match path.to_str() {
             Some(path) => (Some(path.to_owned()), None),
             None => (None, Some(hex(&os_path_key(path.as_os_str())))),
@@ -336,9 +462,17 @@ impl Diagnostic {
             code: code.to_owned(),
             severity: DiagnosticSeverity::Error,
             message,
+            source_id: None,
             path_utf8,
             path_bytes_hex,
         }
+    }
+
+    /// Attaches the legacy entry identity that produced the diagnostic.
+    #[must_use]
+    pub(crate) fn with_source_id(mut self, source_id: impl Into<String>) -> Self {
+        self.source_id = Some(source_id.into());
+        self
     }
 }
 
@@ -354,6 +488,52 @@ pub struct Plan {
 impl Plan {
     pub fn has_mutations(&self) -> bool {
         !self.operations.is_empty()
+    }
+
+    /// Counts every action, then separates the two collision families so a
+    /// surface never merges a verified candidate with a foreign path.
+    #[must_use]
+    pub fn summary(&self) -> PlanSummary {
+        let mut actions = BTreeMap::new();
+        let mut summary = PlanSummary::default();
+        for entry in &self.entries {
+            *actions
+                .entry(action_key(entry.action).to_owned())
+                .or_insert(0) += 1;
+            if entry.action == PlanAction::Adoptable {
+                summary.verified_legacy_candidates += 1;
+            }
+            if entry.action == PlanAction::Conflict && entry.reason.is_matching_unmanaged() {
+                summary.matching_unmanaged += 1;
+            }
+        }
+        summary.actions = actions;
+        summary
+    }
+}
+
+/// Counts derived from a plan, shared by every renderer and by the envelope.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PlanSummary {
+    pub actions: BTreeMap<String, usize>,
+    pub verified_legacy_candidates: usize,
+    pub matching_unmanaged: usize,
+}
+
+/// Stable public key of a plan action, shared by the summary and the JSON.
+#[must_use]
+pub const fn action_key(action: PlanAction) -> &'static str {
+    match action {
+        PlanAction::Create => "create",
+        PlanAction::Update => "update",
+        PlanAction::Remove => "remove",
+        PlanAction::Noop => "noop",
+        PlanAction::Adoptable => "adoptable",
+        PlanAction::Drifted => "drifted",
+        PlanAction::Conflict => "conflict",
+        PlanAction::RetainedUnmanaged => "retained_unmanaged",
+        PlanAction::RecoveryRequired => "recovery_required",
+        PlanAction::WriteReceipt => "write_receipt",
     }
 }
 
@@ -431,7 +611,7 @@ pub fn build_plan_with_removal_policy(
                 PlanAction::Conflict,
                 asset,
                 Owner::Unmanaged,
-                "destination violates the configured root policy",
+                PlanReason::RootPolicyViolation,
                 OwnershipClaim::None,
             ));
             continue;
@@ -439,59 +619,60 @@ pub fn build_plan_with_removal_policy(
         let receipt_asset = owned_by_path.get(&path_key(&asset.destination)).copied();
         let receipt_claim = receipt_asset.map(receipt_claim);
         match inspect_path(&asset.destination) {
-            Ok(None) => match receipt_claim {
-                Some(claim) => {
-                    entries.push(entry(
-                        PlanAction::Drifted,
-                        asset,
-                        Owner::ArthurWorkflow,
-                        "managed path is missing",
-                        claim,
-                    ));
-                    applicable = false;
-                }
-                None => {
-                    let operation = create_operation(asset, root);
-                    entries.push(entry(
-                        PlanAction::Create,
-                        asset,
-                        Owner::Unmanaged,
-                        "destination does not exist",
-                        OwnershipClaim::CreatedInTransaction {
-                            operation_id: operation.id.clone(),
-                        },
-                    ));
-                    operations.push(operation);
-                }
-            },
+            // An absent destination is created, whether or not a receipt proved
+            // it before: nothing is overwritten and the recreated node is owned
+            // by the operation that writes it.
+            Ok(None) => {
+                let operation = create_operation(asset, root);
+                let reason = if receipt_claim.is_some() {
+                    PlanReason::ManagedPathMissing
+                } else {
+                    PlanReason::DestinationAbsent
+                };
+                entries.push(entry(
+                    PlanAction::Create,
+                    asset,
+                    receipt_asset.map_or(Owner::Unmanaged, |_| Owner::ArthurWorkflow),
+                    reason,
+                    OwnershipClaim::CreatedInTransaction {
+                        operation_id: operation.id.clone(),
+                    },
+                ));
+                operations.push(operation);
+            }
             Ok(Some(snapshot)) => match (receipt_asset, receipt_claim) {
                 (Some(receipt_asset), Some(claim)) => {
-                    if !snapshot_matches(&snapshot, &receipt_asset.expected) {
-                        entries.push(entry(
-                            PlanAction::Drifted,
-                            asset,
-                            Owner::ArthurWorkflow,
-                            "managed path differs from its receipt proof",
-                            claim,
-                        ));
-                        applicable = false;
-                    } else if snapshot_matches(&snapshot, &asset.payload.expected()) {
+                    // A proven destination that already equals the catalog is a
+                    // no-op even when the receipt records an older fingerprint:
+                    // only the receipt has to converge, never the content.
+                    if snapshot_matches(&snapshot, &asset.payload.expected()) {
                         entries.push(entry(
                             PlanAction::Noop,
                             asset,
                             Owner::ArthurWorkflow,
-                            "managed path already matches the desired state",
+                            PlanReason::AlreadyMatchesDesired,
                             claim,
                         ));
-                    } else {
+                    } else if snapshot_matches(&snapshot, &receipt_asset.expected) {
                         entries.push(entry(
                             PlanAction::Update,
                             asset,
                             Owner::ArthurWorkflow,
-                            "managed path is eligible for a verified update",
+                            PlanReason::EligibleUpdate,
                             claim,
                         ));
                         operations.extend(update_operations(asset, receipt_asset, snapshot, root));
+                    } else {
+                        // The node differs from its proof and from the catalog,
+                        // so no destructive update may be planned.
+                        entries.push(entry(
+                            PlanAction::Drifted,
+                            asset,
+                            Owner::ArthurWorkflow,
+                            PlanReason::ManagedPathDrifted,
+                            claim,
+                        ));
+                        applicable = false;
                     }
                 }
                 _ => {
@@ -505,16 +686,26 @@ pub fn build_plan_with_removal_policy(
                     let healthy = link_health
                         .as_ref()
                         .is_none_or(|health| health.is_healthy());
-                    match legacy
-                        .proof_for(&asset.destination)
-                        .filter(|_| matching && healthy)
-                    {
+                    let scope = legacy.proof_for(&asset.destination);
+                    if let Some(scope) = scope.filter(|_| !(matching && healthy)) {
+                        // The lock names this subtree but the node does not match
+                        // the bundled catalog, so nothing can be transferred.
+                        diagnostics.push(
+                            Diagnostic::path_error(
+                                LEGACY_ENTRY_DOES_NOT_MATCH_CATALOG,
+                                "legacy entry does not match the bundled catalog".to_owned(),
+                                &asset.destination,
+                            )
+                            .with_source_id(scope.source_id.clone()),
+                        );
+                    }
+                    match scope.filter(|_| matching && healthy) {
                         Some(proof) => {
                             entries.push(entry(
                                 PlanAction::Adoptable,
                                 asset,
                                 Owner::VercelSkills,
-                                "verified legacy entry requires explicit adoption",
+                                PlanReason::VerifiedLegacyAdoption,
                                 OwnershipClaim::VerifiedLegacy {
                                     source_id: proof.source_id.clone(),
                                     lock_sha256: proof.lock_sha256.clone(),
@@ -526,29 +717,29 @@ pub fn build_plan_with_removal_policy(
                         None if matching && healthy => {
                             diagnostics.push(Diagnostic::path_error(
                                 MATCHING_UNMANAGED_WITHOUT_PROOF,
-                                "matching unmanaged asset has no ownership proof".to_owned(),
+                                PlanReason::MatchingUnmanagedWithoutProof
+                                    .message()
+                                    .to_owned(),
                                 &asset.destination,
                             ));
                             entries.push(entry(
                                 PlanAction::Conflict,
                                 asset,
                                 Owner::Unmanaged,
-                                "matching unmanaged asset has no ownership proof",
+                                PlanReason::MatchingUnmanagedWithoutProof,
                                 OwnershipClaim::None,
                             ));
                             applicable = false;
                         }
                         None => {
                             let reason = match link_health {
-                                Some(LinkHealth::Broken) => "unmanaged symlink is broken",
-                                Some(LinkHealth::Cyclic) => "unmanaged symlink is cyclic",
-                                Some(LinkHealth::Escaped) => {
-                                    "unmanaged symlink resolves outside the allowed target"
-                                }
+                                Some(LinkHealth::Broken) => PlanReason::UnmanagedSymlinkBroken,
+                                Some(LinkHealth::Cyclic) => PlanReason::UnmanagedSymlinkCyclic,
+                                Some(LinkHealth::Escaped) => PlanReason::UnmanagedSymlinkEscaped,
                                 Some(LinkHealth::Healthy) if !matching => {
-                                    "unmanaged symlink targets a different canonical asset"
+                                    PlanReason::UnmanagedSymlinkDifferentTarget
                                 }
-                                _ => "unmanaged path conflicts with the desired asset",
+                                _ => PlanReason::UnmanagedConflict,
                             };
                             entries.push(entry(
                                 PlanAction::Conflict,
@@ -572,7 +763,7 @@ pub fn build_plan_with_removal_policy(
                     PlanAction::Conflict,
                     asset,
                     receipt_asset.map_or(Owner::Unmanaged, |_| Owner::ArthurWorkflow),
-                    "filesystem inspection failed",
+                    PlanReason::FilesystemInspectionFailed,
                     receipt_claim.unwrap_or(OwnershipClaim::None),
                 ));
                 applicable = false;
@@ -611,7 +802,7 @@ pub fn build_plan_with_removal_policy(
                 PlanAction::Conflict,
                 &synthetic,
                 Owner::ArthurWorkflow,
-                "owned destination violates the configured root policy",
+                PlanReason::OwnedRootPolicyViolation,
                 claim,
             ));
             applicable = false;
@@ -632,7 +823,7 @@ pub fn build_plan_with_removal_policy(
                                 PlanAction::RetainedUnmanaged,
                                 &synthetic,
                                 Owner::ArthurWorkflow,
-                                "owned directory contains unmanaged content and will be released",
+                                PlanReason::OwnedDirectoryRetained,
                                 claim,
                             ));
                             continue;
@@ -652,7 +843,7 @@ pub fn build_plan_with_removal_policy(
                     PlanAction::Remove,
                     &synthetic,
                     Owner::ArthurWorkflow,
-                    "owned asset is absent from the desired state",
+                    PlanReason::OwnedAbsentFromDesired,
                     claim,
                 ));
                 operations.push(remove_operation(receipt_asset, snapshot, root));
@@ -663,7 +854,7 @@ pub fn build_plan_with_removal_policy(
                     PlanAction::Remove,
                     &synthetic,
                     Owner::ArthurWorkflow,
-                    "owned asset is already absent and its ownership will be released",
+                    PlanReason::OwnedAbsentReleased,
                     claim,
                 ));
             }
@@ -672,7 +863,7 @@ pub fn build_plan_with_removal_policy(
                     PlanAction::RetainedUnmanaged,
                     &synthetic,
                     Owner::ArthurWorkflow,
-                    "owned asset is retained and its ownership will be released",
+                    PlanReason::OwnedRetainedReleased,
                     claim,
                 ));
             }
@@ -681,7 +872,7 @@ pub fn build_plan_with_removal_policy(
                     PlanAction::Drifted,
                     &synthetic,
                     Owner::ArthurWorkflow,
-                    "owned asset cannot be removed because its proof no longer matches",
+                    PlanReason::OwnedRemovalBlockedByDrift,
                     claim,
                 ));
                 applicable = false;
@@ -731,6 +922,7 @@ pub fn build_plan_with_removal_policy(
             .cmp(&right.code)
             .then(left.path_utf8.cmp(&right.path_utf8))
             .then(left.path_bytes_hex.cmp(&right.path_bytes_hex))
+            .then(left.source_id.cmp(&right.source_id))
     });
 
     Plan {
@@ -883,6 +1075,14 @@ fn validate_existing_ancestor(path: &Path, root: &AllowedRoot) -> Result<(), Str
         }
     }
     Err("destination has no resolvable ancestor".to_owned())
+}
+
+/// Reads one destination without following its final component.
+///
+/// Exposed so the decision builder can snapshot the receipt path through the
+/// same code the planner uses for every other node.
+pub(crate) fn inspect_snapshot(path: &Path) -> io::Result<Option<PathSnapshot>> {
+    inspect_path(path)
 }
 
 fn inspect_path(path: &Path) -> io::Result<Option<PathSnapshot>> {
@@ -1079,17 +1279,17 @@ fn entry(
     action: PlanAction,
     asset: &DesiredAsset,
     owner: Owner,
-    reason: &str,
+    reason: PlanReason,
     ownership: OwnershipClaim,
 ) -> PlanEntry {
-    PlanEntry {
+    PlanEntry::new(
         action,
-        source: asset.source_id.clone(),
-        destination: asset.destination.clone(),
+        asset.source_id.clone(),
+        asset.destination.clone(),
         owner,
-        reason: reason.to_owned(),
+        reason,
         ownership,
-    }
+    )
 }
 
 fn receipt_claim(asset: &OwnedAssetState) -> OwnershipClaim {
@@ -1117,6 +1317,7 @@ const fn mutation_rank(kind: MutationKind) -> u8 {
         MutationKind::ReplaceFile => 3,
         MutationKind::SetMode => 4,
         MutationKind::CreateSymlink => 5,
+        MutationKind::WriteReceipt => 6,
     }
 }
 
@@ -1128,6 +1329,8 @@ const fn mutation_phase(kind: MutationKind) -> u8 {
         | MutationKind::ReplaceFile
         | MutationKind::SetMode
         | MutationKind::CreateSymlink => 2,
+        // The receipt is the last mutation of every transaction.
+        MutationKind::WriteReceipt => 3,
     }
 }
 
@@ -1229,8 +1432,9 @@ mod tests {
     use super::{
         AllowedRoot, ClaudeSymlinkPolicy, DesiredAsset, DesiredPayload, ExpectedNode,
         LegacyOwnership, LegacyProofScope, MATCHING_UNMANAGED_WITHOUT_PROOF, MutationKind,
-        OwnedAssetState, OwnershipBasis, OwnershipClaim, PathPolicy, PlanAction, PlannedInverse,
-        RemovalPolicy, build_plan, build_plan_with_removal_policy, normalize_absolute,
+        OwnedAssetState, OwnershipBasis, OwnershipClaim, PathPolicy, PlanAction, PlanReason,
+        PlannedInverse, RemovalPolicy, build_plan, build_plan_with_removal_policy,
+        normalize_absolute,
     };
 
     fn policy(root: &std::path::Path) -> PathPolicy {
@@ -1679,12 +1883,22 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "duplicate_receipt_destination")
         );
+        // A desired destination that vanished is recreated; an owned destination
+        // that is no longer desired still needs an explicit removal decision.
+        assert_eq!(
+            plan.entries
+                .iter()
+                .filter(|entry| entry.action == PlanAction::Create
+                    && entry.reason == PlanReason::ManagedPathMissing)
+                .count(),
+            1
+        );
         assert_eq!(
             plan.entries
                 .iter()
                 .filter(|entry| entry.action == PlanAction::Drifted)
                 .count(),
-            2
+            1
         );
     }
 
@@ -1761,12 +1975,12 @@ mod tests {
         assert!(
             plan.entries
                 .iter()
-                .any(|entry| entry.reason.contains("broken"))
+                .any(|entry| entry.reason == PlanReason::UnmanagedSymlinkBroken)
         );
         assert!(
             plan.entries
                 .iter()
-                .any(|entry| entry.reason.contains("cyclic"))
+                .any(|entry| entry.reason == PlanReason::UnmanagedSymlinkCyclic)
         );
         Ok(())
     }
@@ -1825,9 +2039,9 @@ mod tests {
 
         assert_eq!(entries["adoptable"].action, PlanAction::Adoptable);
         assert_eq!(entries["wrong"].action, PlanAction::Conflict);
-        assert!(entries["wrong"].reason.contains("different canonical"));
+        assert!(entries["wrong"].reason == PlanReason::UnmanagedSymlinkDifferentTarget);
         assert_eq!(entries["escaped"].action, PlanAction::Conflict);
-        assert!(entries["escaped"].reason.contains("outside"));
+        assert!(entries["escaped"].reason == PlanReason::UnmanagedSymlinkEscaped);
         Ok(())
     }
 
@@ -1948,7 +2162,7 @@ mod tests {
         assert!(plan.entries.iter().any(|entry| {
             entry.destination == outside
                 && entry.action == PlanAction::Conflict
-                && entry.reason.contains("root policy")
+                && entry.reason == PlanReason::OwnedRootPolicyViolation
         }));
         assert!(
             plan.diagnostics
@@ -2090,12 +2304,12 @@ mod tests {
         assert!(plan.entries.iter().any(|entry| {
             entry.source == "chain"
                 && entry.action == PlanAction::Conflict
-                && entry.reason.contains("cyclic")
+                && entry.reason == PlanReason::UnmanagedSymlinkCyclic
         }));
         assert!(plan.entries.iter().any(|entry| {
             entry.source == "blocked"
                 && entry.action == PlanAction::Conflict
-                && entry.reason.contains("outside")
+                && entry.reason == PlanReason::UnmanagedSymlinkEscaped
         }));
         assert_eq!(normalize_absolute(Path::new("relative")), None);
         Ok(())

@@ -90,17 +90,33 @@ pub fn operations_for_plan(
         return Err(OperationBuildError::PlanBlocked);
     }
     validate_plan_receipt_coverage(plan, next_receipt)?;
-    let mut operations = plan
-        .operations
-        .iter()
-        .enumerate()
-        .map(|(index, mutation)| operation_for_mutation(index, mutation, roots))
-        .collect::<Result<Vec<_>, _>>()?;
-    let receipt = receipt_operation(roots, next_receipt, transaction_id)?;
-    if receipt.precondition != receipt.expected_after {
-        operations.push(receipt);
+    let mut operations = filesystem_operations(plan, roots)?;
+    // The decision decides whether the receipt converges; a semantically
+    // current receipt must never be rewritten just to renew its identifier.
+    if plans_receipt_commit(plan) {
+        operations.push(receipt_operation(roots, next_receipt, transaction_id)?);
     }
     Ok(operations)
+}
+
+/// True when the decision planned the receipt commit itself.
+fn plans_receipt_commit(plan: &Plan) -> bool {
+    plan.operations
+        .iter()
+        .any(|mutation| mutation.kind == MutationKind::WriteReceipt)
+}
+
+/// Maps every filesystem mutation, leaving the receipt marker to its own builder.
+fn filesystem_operations(
+    plan: &Plan,
+    roots: &ResolvedRoots,
+) -> Result<Vec<Operation>, OperationBuildError> {
+    plan.operations
+        .iter()
+        .enumerate()
+        .filter(|(_, mutation)| mutation.kind != MutationKind::WriteReceipt)
+        .map(|(index, mutation)| operation_for_mutation(index, mutation, roots))
+        .collect()
 }
 
 pub fn operations_for_adoption(
@@ -151,12 +167,7 @@ pub fn operations_for_import(
         )?,
         None => Vec::new(),
     };
-    let mut filesystem = plan
-        .operations
-        .iter()
-        .enumerate()
-        .map(|(index, mutation)| operation_for_mutation(index, mutation, roots))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut filesystem = filesystem_operations(plan, roots)?;
     for operation in &mut filesystem {
         if let OwnershipProof::Receipt { source_id, sha256 } = &operation.ownership {
             operation.ownership = OwnershipProof::Adopted {
@@ -166,7 +177,11 @@ pub fn operations_for_import(
         }
     }
     operations.append(&mut filesystem);
-    operations.push(receipt_operation(roots, next_receipt, transaction_id)?);
+    // A lock rewrite alone never renews the receipt: only the decision decides
+    // whether the recorded metadata has to converge.
+    if plans_receipt_commit(plan) {
+        operations.push(receipt_operation(roots, next_receipt, transaction_id)?);
+    }
     Ok(operations)
 }
 
@@ -273,12 +288,16 @@ fn validate_plan_receipt_coverage(
             | PlanAction::Drifted
             | PlanAction::Conflict
             | PlanAction::RetainedUnmanaged
-            | PlanAction::RecoveryRequired => {}
+            | PlanAction::RecoveryRequired
+            | PlanAction::WriteReceipt => {}
         }
     }
 
     for mutation in &plan.operations {
-        if mutation.kind == MutationKind::RemoveOwnedPath {
+        if matches!(
+            mutation.kind,
+            MutationKind::RemoveOwnedPath | MutationKind::WriteReceipt
+        ) {
             continue;
         }
         let Some(owned) = receipt.owned_asset(&mutation.destination) else {
@@ -335,7 +354,7 @@ fn owned_matches_mutation(owned: &OwnedAsset, mutation: &PlannedMutation) -> boo
         MutationKind::WriteFile | MutationKind::ReplaceFile => owned.kind == OwnedAssetKind::File,
         MutationKind::CreateSymlink => owned.kind == OwnedAssetKind::Symlink,
         MutationKind::SetMode => owned.kind != OwnedAssetKind::Symlink,
-        MutationKind::RemoveOwnedPath => false,
+        MutationKind::RemoveOwnedPath | MutationKind::WriteReceipt => false,
     };
     kind_matches
         && owned.hash == mutation.content_sha256
@@ -410,6 +429,11 @@ fn operation_for_mutation(
             PathSnapshot::absent(),
             OperationPayload::None,
         ),
+        // Filtered out before this point: the receipt bytes only exist once the
+        // transaction identifier is allocated.
+        MutationKind::WriteReceipt => {
+            return Err(OperationBuildError::MissingPayload(mutation.id.clone()));
+        }
     };
     let inverse = match &mutation.inverse {
         PlannedInverse::RemoveCreated => Inverse::RemoveCreated,
@@ -562,7 +586,7 @@ mod tests {
     use crate::plan::{
         DesiredAsset, DesiredPayload, MutationKind, NodeKind, OwnershipClaim,
         OwnershipProof as PlanOwnership, PathSnapshot as PlanSnapshot, Plan, PlanAction, PlanEntry,
-        PlannedInverse, PlannedMutation, Precondition as PlanPrecondition,
+        PlanReason, PlannedInverse, PlannedMutation, Precondition as PlanPrecondition,
     };
     use crate::provider::{ProviderId, RootIdentity, resolve_roots_from};
     use crate::receipt::{OwnedAsset, OwnedAssetKind, Receipt};
@@ -692,7 +716,7 @@ mod tests {
             source: "expected".to_owned(),
             destination: destination.clone(),
             owner: crate::plan::Owner::Unmanaged,
-            reason: String::new(),
+            reason: PlanReason::AlreadyMatchesDesired,
             ownership: OwnershipClaim::None,
         });
         let mut receipt = Receipt::new("0.1.0", "a".repeat(64), &roots);
@@ -780,7 +804,7 @@ mod tests {
             source: format!("terminal-{index}"),
             destination: roots.canonical_skills.join(format!("terminal-{index}")),
             owner: crate::plan::Owner::Unmanaged,
-            reason: String::new(),
+            reason: PlanReason::AlreadyMatchesDesired,
             ownership: OwnershipClaim::None,
         })
         .collect();
@@ -1173,7 +1197,10 @@ mod tests {
         fs::set_permissions(&roots.receipt_path, fs::Permissions::from_mode(0o600))
             .unwrap_or_else(|error| panic!("receipt mode failed: {error}"));
 
-        let operations = operations_for_plan(&empty_plan(true), &roots, &previous, "new-tx")
+        let mut plan = empty_plan(true);
+        crate::lifecycle::push_receipt_convergence(&mut plan, &roots)
+            .unwrap_or_else(|error| panic!("receipt convergence failed: {error}"));
+        let operations = operations_for_plan(&plan, &roots, &previous, "new-tx")
             .unwrap_or_else(|error| panic!("receipt operation failed: {error}"));
 
         assert_eq!(operations.len(), 1);
@@ -1212,8 +1239,10 @@ mod tests {
             link_target: None,
             references: vec![ProviderId::Codex],
         });
-        let plan = plan_desired_state(&roots, None, &desired)
+        let mut plan = plan_desired_state(&roots, None, &desired)
             .unwrap_or_else(|error| panic!("planning failed: {error}"));
+        crate::lifecycle::push_receipt_convergence(&mut plan, &roots)
+            .unwrap_or_else(|error| panic!("receipt convergence failed: {error}"));
         let operations = operations_for_plan(&plan, &roots, &receipt, "tx-1")
             .unwrap_or_else(|error| panic!("operation build failed: {error}"));
         assert_eq!(operations.len(), 2);

@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 
 use arthur_skills::app::{App, Provider, Review};
 use arthur_skills::plan::{
-    Owner, OwnershipClaim, PLAN_SCHEMA_VERSION, Plan, PlanAction, PlanEntry,
+    Owner, OwnershipClaim, PLAN_SCHEMA_VERSION, Plan, PlanAction, PlanEntry, PlanReason,
 };
 use arthur_skills::provider::resolve_roots_from;
 use arthur_skills::ui::render;
@@ -121,7 +121,7 @@ fn review_projection_labels_unknown_roots_and_renders_applicable_plans() -> Test
             source: "skills/example/SKILL.md".to_owned(),
             destination,
             owner: Owner::ArthurWorkflow,
-            reason: "already current".to_owned(),
+            reason: PlanReason::AlreadyMatchesDesired,
             ownership: OwnershipClaim::None,
         }],
         operations: Vec::new(),

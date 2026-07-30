@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, Write};
 
 use crate::app::{Action, App, Outcome, Provider, Step, blocked_review_remediation};
-use crate::output::{asset_changes, pending_action_label};
+use crate::output::{asset_changes, pending_action_label, provenance_lines};
 use crate::transaction::SignalFlags;
 use crate::workflow::WorkflowState;
 
@@ -182,6 +182,9 @@ fn render_review(app: &App, output: &mut impl Write) -> io::Result<()> {
                 assessment.legacy_skills_to_clean
             )?;
         }
+        for line in provenance_lines(&review.summary, review.receipt_convergence) {
+            writeln!(output, "{line}")?;
+        }
         let changes = asset_changes(
             review
                 .groups
@@ -203,6 +206,9 @@ fn render_review(app: &App, output: &mut impl Write) -> io::Result<()> {
         return Ok(());
     }
     writeln!(output, "Plan review: the complete catalog is included")?;
+    for line in provenance_lines(&review.summary, review.receipt_convergence) {
+        writeln!(output, "{line}")?;
+    }
     for ((root, action), entries) in &review.groups {
         writeln!(output, "{:?} [{}]: {}", action, root, entries.len())?;
         for entry in entries {
@@ -211,7 +217,7 @@ fn render_review(app: &App, output: &mut impl Write) -> io::Result<()> {
                 "  {}: {} ({})",
                 entry.source,
                 entry.destination.display(),
-                entry.reason
+                entry.message()
             )?;
         }
     }
@@ -244,7 +250,7 @@ mod tests {
 
     use super::{PlainExit, confirm_plan, read_line, render_review, select_providers};
     use crate::app::{App, Provider, Review};
-    use crate::plan::{Owner, OwnershipClaim, PlanAction, PlanEntry};
+    use crate::plan::{Owner, OwnershipClaim, PlanAction, PlanEntry, PlanReason, PlanSummary};
     use crate::transaction::SignalFlags;
     use crate::workflow::{AssetSummary, WorkflowAssessment, WorkflowState};
 
@@ -338,6 +344,8 @@ mod tests {
 
         let mut app = App::new(1, &[]);
         app.set_review(Review {
+            summary: PlanSummary::default(),
+            receipt_convergence: false,
             verified_legacy_candidates: 0,
             groups: Default::default(),
             applicable: true,
@@ -360,7 +368,7 @@ mod tests {
                 source: "skills/coss/SKILL.md".to_owned(),
                 destination: "/home/user/.agents/skills/coss/SKILL.md".into(),
                 owner: Owner::ArthurWorkflow,
-                reason: "managed path needs an update".to_owned(),
+                reason: PlanReason::EligibleUpdate,
                 ownership: OwnershipClaim::None,
             },
             PlanEntry {
@@ -368,12 +376,14 @@ mod tests {
                 source: "agents/codex/docs-researcher.toml".to_owned(),
                 destination: "/home/user/.codex/agents/docs-researcher.toml".into(),
                 owner: Owner::ArthurWorkflow,
-                reason: "managed path is missing".to_owned(),
+                reason: PlanReason::ManagedPathMissing,
                 ownership: OwnershipClaim::None,
             },
         ];
         let mut app = App::new(1, &[]);
         app.set_review(Review {
+            summary: PlanSummary::default(),
+            receipt_convergence: false,
             verified_legacy_candidates: 0,
             groups: [(
                 ("/home/user".to_owned(), PlanAction::Update),

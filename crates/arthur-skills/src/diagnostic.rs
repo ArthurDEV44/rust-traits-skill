@@ -268,6 +268,7 @@ fn output_health_issue(issue: &HealthIssue) -> OutputDiagnostic {
             IssueSeverity::Error => OutputSeverity::Error,
         },
         message: issue.message.clone(),
+        source_id: None,
         path_utf8,
         path_bytes_hex,
         remediation,

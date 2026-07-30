@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 use super::{
-    DIRECTORY_MODE, LifecycleError, LifecycleIntent, ManagedDesired, build_receipt,
-    insert_catalog_file, insert_directory, insert_managed, maybe_insert_container,
-    prepare_lifecycle_transition, required_provider, selected_after, strip_catalog_prefix,
+    DIRECTORY_MODE, LegacyEvidence, LifecycleError, LifecycleRequest, ManagedDesired,
+    UNSAFE_CONTAINER, build_receipt, decide, insert_catalog_file, insert_directory, insert_managed,
+    maybe_insert_container, required_provider, selected_after, strip_catalog_prefix,
 };
 use crate::catalog::Catalog;
 use crate::engine::EngineError;
@@ -62,19 +62,19 @@ fn lifecycle_errors_and_selection_have_stable_contracts() {
     assert!(receipt.source().is_some());
 
     assert!(matches!(
-        selected_after(&LifecycleIntent::Install { providers: vec![] }, &[]),
+        selected_after(&LifecycleRequest::Reconcile { providers: vec![] }, &[]),
         Err(LifecycleError::EmptyProviderSelection)
     ));
     assert_eq!(
         selected_after(
-            &LifecycleIntent::UninstallProvider(ProviderId::Claude),
+            &LifecycleRequest::UninstallProvider(ProviderId::Claude),
             &ProviderId::ALL,
         )
         .unwrap_or_else(|error| panic!("selection failed: {error}")),
         vec![ProviderId::Codex]
     );
     assert!(
-        selected_after(&LifecycleIntent::UninstallAll, &ProviderId::ALL)
+        selected_after(&LifecycleRequest::UninstallAll, &ProviderId::ALL)
             .unwrap_or_else(|error| panic!("selection failed: {error}"))
             .is_empty()
     );
@@ -238,22 +238,22 @@ fn transition_requires_every_managed_root_and_preserves_historical_roots() -> Te
     let current = Receipt::new("0.1.0", "a".repeat(64), &both);
     let catalog = Catalog::load()?;
     assert!(matches!(
-        prepare_lifecycle_transition(
+        decide(
             &catalog,
             &claude,
             Some(&current),
-            &LifecycleIntent::UninstallProvider(ProviderId::Claude),
-            None,
+            &LifecycleRequest::UninstallProvider(ProviderId::Claude),
+            &LegacyEvidence::Absent,
         ),
         Err(LifecycleError::MissingProviderRoot(ProviderId::Codex))
     ));
     assert!(matches!(
-        prepare_lifecycle_transition(
+        decide(
             &catalog,
             &claude,
             None,
-            &LifecycleIntent::Install { providers: vec![] },
-            None,
+            &LifecycleRequest::Reconcile { providers: vec![] },
+            &LegacyEvidence::Absent,
         ),
         Err(LifecycleError::EmptyProviderSelection)
     ));
@@ -284,18 +284,24 @@ fn transition_requires_every_managed_root_and_preserves_historical_roots() -> Te
     let canonical_container = claude.canonical_skills.clone();
     std::fs::create_dir_all(canonical_container.parent().ok_or("no canonical parent")?)?;
     std::fs::write(&canonical_container, b"wrong type")?;
-    assert!(matches!(
-        prepare_lifecycle_transition(
-            &catalog,
-            &claude,
-            None,
-            &LifecycleIntent::Install {
-                providers: vec![ProviderId::Claude],
-            },
-            None,
-        ),
-        Err(LifecycleError::UnsafeContainer { .. })
-    ));
+    // An unsafe container produces a complete blocked decision, never a partial
+    // transition: nothing can be applied and the exact path is reported.
+    let blocked = decide(
+        &catalog,
+        &claude,
+        None,
+        &LifecycleRequest::Reconcile {
+            providers: vec![ProviderId::Claude],
+        },
+        &LegacyEvidence::Absent,
+    )?;
+    assert!(!blocked.applicable());
+    assert!(blocked.plan.operations.is_empty());
+    assert!(blocked.receipt.assets.is_empty());
+    assert!(blocked.plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == UNSAFE_CONTAINER
+            && diagnostic.path_utf8.as_deref() == canonical_container.to_str()
+    }));
     Ok(())
 }
 

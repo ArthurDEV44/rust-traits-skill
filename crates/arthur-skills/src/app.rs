@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::lifecycle::LifecycleNotice;
-use crate::plan::{Plan, PlanAction, PlanEntry};
+use crate::lifecycle::{LifecycleDecision, LifecycleNotice};
+use crate::plan::{Plan, PlanAction, PlanEntry, PlanSummary};
 pub use crate::provider::ProviderId as Provider;
 use crate::provider::ResolvedRoots;
 use crate::workflow::WorkflowAssessment;
@@ -38,22 +38,43 @@ pub struct Review {
     pub applicable: bool,
     pub notices: Vec<LifecycleNotice>,
     pub assessment: Option<WorkflowAssessment>,
+    /// Counts projected from the decision, never recomputed by a renderer.
+    pub summary: PlanSummary,
     /// Verified legacy candidates, the only case where `adopt` can succeed.
     pub verified_legacy_candidates: usize,
+    /// True when the decision plans the receipt commit itself.
+    pub receipt_convergence: bool,
 }
 
 impl Review {
-    pub fn from_plan(plan: &Plan, notices: &[LifecycleNotice], roots: &ResolvedRoots) -> Self {
-        Self::build(plan, notices, roots, None)
+    /// Projects the decision the command is about to apply.
+    pub fn from_decision(decision: &LifecycleDecision, roots: &ResolvedRoots) -> Self {
+        Self::build(
+            &decision.plan,
+            &decision.notices,
+            roots,
+            None,
+            decision.receipt_change.required,
+        )
     }
 
-    pub fn for_workflow(
-        plan: &Plan,
-        notices: &[LifecycleNotice],
+    /// Projects the decision together with its workflow assessment.
+    pub fn for_decision(
+        decision: &LifecycleDecision,
         roots: &ResolvedRoots,
         assessment: WorkflowAssessment,
     ) -> Self {
-        Self::build(plan, notices, roots, Some(assessment))
+        Self::build(
+            &decision.plan,
+            &decision.notices,
+            roots,
+            Some(assessment),
+            decision.receipt_change.required,
+        )
+    }
+
+    pub fn from_plan(plan: &Plan, notices: &[LifecycleNotice], roots: &ResolvedRoots) -> Self {
+        Self::build(plan, notices, roots, None, false)
     }
 
     fn build(
@@ -61,6 +82,7 @@ impl Review {
         notices: &[LifecycleNotice],
         roots: &ResolvedRoots,
         assessment: Option<WorkflowAssessment>,
+        receipt_convergence: bool,
     ) -> Self {
         let mut groups = BTreeMap::<(String, PlanAction), Vec<PlanEntry>>::new();
         for entry in &plan.entries {
@@ -77,16 +99,15 @@ impl Review {
                 .or_default()
                 .push(entry.clone());
         }
+        let summary = plan.summary();
         Self {
             groups,
             applicable: plan.applicable,
             notices: notices.to_vec(),
             assessment,
-            verified_legacy_candidates: plan
-                .entries
-                .iter()
-                .filter(|entry| entry.action == PlanAction::Adoptable)
-                .count(),
+            verified_legacy_candidates: summary.verified_legacy_candidates,
+            summary,
+            receipt_convergence,
         }
     }
 }
@@ -229,6 +250,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{Action, App, Outcome, Provider, Review};
+    use crate::plan::PlanSummary;
 
     #[test]
     fn selection_requires_a_provider_and_reports_detected_state() {
@@ -264,6 +286,8 @@ mod tests {
             applicable: false,
             notices: Vec::new(),
             assessment: None,
+            summary: PlanSummary::default(),
+            receipt_convergence: false,
         });
         assert_eq!(app.update(Action::Toggle), Outcome::Continue);
         assert_eq!(app.update(Action::Confirm), Outcome::Continue);

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use arthur_skills::adoption::{self, CatalogEntry, EntryType, LegacyImportPlan};
 use arthur_skills::catalog::{AssetKind, Catalog, Provider as CatalogProvider};
-use arthur_skills::lifecycle::{LifecycleError, LifecycleIntent, prepare_lifecycle_transition};
+use arthur_skills::lifecycle::{LegacyEvidence, LifecycleRequest, RECEIPT_UNREADABLE, decide};
 use arthur_skills::plan::{
     MATCHING_UNMANAGED_WITHOUT_PROOF, OwnershipBasis, OwnershipClaim, PlanAction, PlanEntry,
 };
@@ -169,14 +169,14 @@ fn a_verified_lock_entry_proves_its_skill_and_nothing_else() -> TestResult {
 
     write_legacy_lock(&roots, &[PROVEN_SKILL])?;
     let legacy = legacy_import_plan(&catalog, &roots)?;
-    let transition = prepare_lifecycle_transition(
+    let transition = decide(
         &catalog,
         &roots,
         None,
-        &LifecycleIntent::Install {
+        &LifecycleRequest::Reconcile {
             providers: ProviderId::ALL.to_vec(),
         },
-        Some(&legacy),
+        &LegacyEvidence::Verified(&legacy),
     )?;
 
     let proven_entry = entry_for(&transition.plan.entries, &proven).ok_or("proven skill absent")?;
@@ -233,25 +233,51 @@ fn an_unusable_receipt_blocks_the_decision_without_falling_back_to_disk() -> Tes
     let home = tempfile::tempdir()?;
     let current = roots(&home)?;
     let catalog = Catalog::load()?;
-    let intent = LifecycleIntent::Install {
+    let intent = LifecycleRequest::Reconcile {
         providers: ProviderId::ALL.to_vec(),
     };
 
+    // A receipt this CLI cannot verify produces a complete blocked decision: no
+    // observed content may become a fallback ownership proof.
     let mut future = Receipt::new("0.1.0", "a".repeat(64), &current);
     future.schema_version = 2;
-    assert!(matches!(
-        prepare_lifecycle_transition(&catalog, &current, Some(&future), &intent, None),
-        Err(LifecycleError::Receipt(_))
-    ));
+    let blocked = decide(
+        &catalog,
+        &current,
+        Some(&future),
+        &intent,
+        &LegacyEvidence::Absent,
+    )?;
+    assert!(!blocked.applicable());
+    assert!(blocked.plan.entries.is_empty());
+    assert!(blocked.plan.operations.is_empty());
+    assert!(blocked.receipt.assets.is_empty());
+    assert!(
+        blocked
+            .plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RECEIPT_UNREADABLE)
+    );
 
     let other_home = tempfile::tempdir()?;
     let other_roots = roots(&other_home)?;
     let foreign = Receipt::new("0.1.0", "a".repeat(64), &other_roots);
-    let mismatch = prepare_lifecycle_transition(&catalog, &current, Some(&foreign), &intent, None);
-    let Err(LifecycleError::Receipt(error)) = mismatch else {
-        return Err("a foreign root identity must block the decision".into());
-    };
-    assert!(error.to_string().contains(&RootScope::Home.to_string()));
+    let mismatch = decide(
+        &catalog,
+        &current,
+        Some(&foreign),
+        &intent,
+        &LegacyEvidence::Absent,
+    )?;
+    assert!(!mismatch.applicable());
+    let diagnostic = mismatch
+        .plan
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == RECEIPT_UNREADABLE)
+        .ok_or("a foreign root identity must block the decision")?;
+    assert!(diagnostic.message.contains(&RootScope::Home.to_string()));
     Ok(())
 }
 

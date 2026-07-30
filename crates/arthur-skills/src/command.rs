@@ -12,10 +12,7 @@ use crate::adoption::{self, CatalogEntry, EntryType, LegacyImportPlan};
 use crate::app::{App, Review};
 use crate::catalog::{AssetKind, Catalog};
 use crate::cli::{Cli, Command, ConfirmationArgs, MutationArgs, ProviderArgs, UninstallArgs};
-use crate::lifecycle::{
-    LifecycleIntent, LifecycleTransition, prepare_import_transition, prepare_lifecycle_transition,
-    prepare_reconciliation_transition,
-};
+use crate::lifecycle::{LegacyEvidence, LifecycleDecision, LifecycleRequest, decide};
 use crate::operations::{operations_for_adoption, operations_for_import, operations_for_plan};
 use crate::output::{
     CONFLICT_EXIT_CODE, Envelope, OutputDiagnostic, OutputSeverity, OutputStatus, path_fields,
@@ -31,7 +28,7 @@ use crate::transaction::{
     snapshot_path,
 };
 use crate::ui::{self, UiExit};
-use crate::workflow::{WorkflowAssessment, WorkflowState, assess};
+use crate::workflow::{WorkflowAssessment, assess_decision};
 use crate::{engine, plan};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +49,26 @@ struct ApplyRequest<'a> {
     signals: &'a SignalFlags,
     assessment: Option<&'a WorkflowAssessment>,
     legacy_import: Option<&'a LegacyImportPlan>,
+}
+
+/// Selects the request for a converging command.
+///
+/// `plan`, `install` and `update` resolve it identically from the same observed
+/// state, so their decisions cannot diverge for one installation.
+fn converge_request(
+    current: Option<&Receipt>,
+    legacy: &LegacyEvidence<'_>,
+    providers: &[ProviderId],
+) -> LifecycleRequest {
+    if current.is_none() && legacy.verified().is_some() {
+        LifecycleRequest::Import {
+            providers: providers.to_vec(),
+        }
+    } else {
+        LifecycleRequest::Reconcile {
+            providers: providers.to_vec(),
+        }
+    }
 }
 
 pub fn execute(cli: &Cli) -> Envelope {
@@ -138,20 +155,11 @@ fn run_plan(
         Ok(context) => context,
         Err(envelope) => return *envelope,
     };
-    let legacy_import = match legacy_import_plan(catalog, &roots) {
-        Ok(legacy) => legacy,
-        Err(message) => return lifecycle_error("plan", providers, message),
-    };
-    match prepare_lifecycle_transition(
-        catalog,
-        &roots,
-        current.as_ref(),
-        &LifecycleIntent::Install {
-            providers: providers.clone(),
-        },
-        legacy_import.as_ref(),
-    ) {
-        Ok(transition) => report_transition("plan", transition),
+    let legacy_import = legacy_import_plan(catalog, &roots);
+    let legacy = legacy_evidence(&legacy_import);
+    let request = converge_request(current.as_ref(), &legacy, &providers);
+    match decide(catalog, &roots, current.as_ref(), &request, &legacy) {
+        Ok(decision) => report_decision("plan", decision),
         Err(error) => lifecycle_error("plan", providers, error.to_string()),
     }
 }
@@ -168,6 +176,19 @@ fn legacy_import_plan(
         &catalog_skill_names(catalog),
     )
     .map_err(|error| error.to_string())
+}
+
+/// Turns the shared inspection into the evidence the decision builder consumes.
+///
+/// A lock this CLI cannot verify becomes a blocked decision instead of an error
+/// path that could select a different transition.
+fn legacy_evidence(inspection: &Result<Option<LegacyImportPlan>, String>) -> LegacyEvidence<'_> {
+    match inspection {
+        Ok(plan) => plan.as_ref().into(),
+        Err(detail) => LegacyEvidence::Unsupported {
+            detail: detail.clone(),
+        },
+    }
 }
 
 fn run_install(
@@ -196,57 +217,21 @@ fn run_install(
         Ok(context) => context,
         Err(envelope) => return *envelope,
     };
-    let legacy_import = match legacy_import_plan(catalog, &roots) {
-        Ok(legacy) => legacy,
-        Err(message) => return lifecycle_error("install", providers, message),
-    };
-    let initial_transition = match prepare_lifecycle_transition(
-        catalog,
-        &roots,
-        current.as_ref(),
-        &LifecycleIntent::Install {
-            providers: providers.clone(),
-        },
-        legacy_import.as_ref(),
-    ) {
-        Ok(transition) => transition,
+    let legacy_import = legacy_import_plan(catalog, &roots);
+    let legacy = legacy_evidence(&legacy_import);
+    let request = converge_request(current.as_ref(), &legacy, &providers);
+    let decision = match decide(catalog, &roots, current.as_ref(), &request, &legacy) {
+        Ok(decision) => decision,
         Err(error) => return lifecycle_error("install", providers, error.to_string()),
     };
-    let assessment = Some(assess(
+    let verified = legacy.verified();
+    let assessment = Some(assess_decision(
         current.as_ref(),
-        &initial_transition.plan,
-        legacy_import
-            .as_ref()
-            .map_or(0, |legacy| legacy.managed_skill_names.len()),
-        legacy_import
-            .as_ref()
-            .map_or(0, |legacy| legacy.obsolete_skill_names.len()),
+        &decision,
+        verified.map_or(0, |legacy| legacy.managed_skill_names.len()),
+        verified.map_or(0, |legacy| legacy.obsolete_skill_names.len()),
     ));
-    let transition = match assessment.as_ref().map(|value| value.state) {
-        Some(WorkflowState::Import) if legacy_import.is_some() => {
-            match prepare_import_transition(catalog, &roots, &providers, legacy_import.as_ref()) {
-                Ok(transition) => transition,
-                Err(error) => return lifecycle_error("install", providers, error.to_string()),
-            }
-        }
-        Some(WorkflowState::Update) => match current.as_ref() {
-            Some(receipt) => {
-                match prepare_reconciliation_transition(
-                    catalog,
-                    &roots,
-                    receipt,
-                    &providers,
-                    legacy_import.as_ref(),
-                ) {
-                    Ok(transition) => transition,
-                    Err(error) => return lifecycle_error("install", providers, error.to_string()),
-                }
-            }
-            None => initial_transition,
-        },
-        _ => initial_transition,
-    };
-    apply_transition(
+    apply_decision(
         ApplyRequest {
             catalog,
             cli,
@@ -255,10 +240,10 @@ fn run_install(
             presentation,
             signals,
             assessment: assessment.as_ref(),
-            legacy_import: legacy_import.as_ref(),
+            legacy_import: verified,
         },
         roots,
-        transition,
+        decision,
     )
 }
 
@@ -332,43 +317,21 @@ fn run_update(
         }
     }
     let providers = managed_providers(&receipt);
-    let legacy_import = match legacy_import_plan(catalog, &roots) {
-        Ok(legacy) => legacy,
-        Err(message) => return lifecycle_error("update", providers, message),
-    };
-    let initial_transition = match prepare_lifecycle_transition(
-        catalog,
-        &roots,
-        Some(&receipt),
-        &LifecycleIntent::Install {
-            providers: providers.clone(),
-        },
-        legacy_import.as_ref(),
-    ) {
-        Ok(transition) => transition,
+    let legacy_import = legacy_import_plan(catalog, &roots);
+    let legacy = legacy_evidence(&legacy_import);
+    let request = converge_request(Some(&receipt), &legacy, &providers);
+    let decision = match decide(catalog, &roots, Some(&receipt), &request, &legacy) {
+        Ok(decision) => decision,
         Err(error) => return lifecycle_error("update", providers, error.to_string()),
     };
-    let assessment = assess(
+    let verified = legacy.verified();
+    let assessment = assess_decision(
         Some(&receipt),
-        &initial_transition.plan,
-        legacy_import
-            .as_ref()
-            .map_or(0, |legacy| legacy.managed_skill_names.len()),
-        legacy_import
-            .as_ref()
-            .map_or(0, |legacy| legacy.obsolete_skill_names.len()),
+        &decision,
+        verified.map_or(0, |legacy| legacy.managed_skill_names.len()),
+        verified.map_or(0, |legacy| legacy.obsolete_skill_names.len()),
     );
-    let transition = match prepare_reconciliation_transition(
-        catalog,
-        &roots,
-        &receipt,
-        &providers,
-        legacy_import.as_ref(),
-    ) {
-        Ok(transition) => transition,
-        Err(error) => return lifecycle_error("update", providers, error.to_string()),
-    };
-    apply_transition(
+    apply_decision(
         ApplyRequest {
             catalog,
             cli,
@@ -377,10 +340,10 @@ fn run_update(
             presentation,
             signals,
             assessment: Some(&assessment),
-            legacy_import: legacy_import.as_ref(),
+            legacy_import: verified,
         },
         roots,
-        transition,
+        decision,
     )
 }
 
@@ -415,8 +378,8 @@ fn run_uninstall(
             "non-interactive uninstall requires one --provider or explicit --all",
         );
     }
-    let intent = if arguments.all {
-        LifecycleIntent::UninstallAll
+    let request = if arguments.all {
+        LifecycleRequest::UninstallAll
     } else if removed.len() == 1 {
         if !managed.contains(&removed[0]) {
             return Envelope::usage(
@@ -424,9 +387,9 @@ fn run_uninstall(
                 format!("provider {} is not managed by this receipt", removed[0]),
             );
         }
-        LifecycleIntent::UninstallProvider(removed[0])
+        LifecycleRequest::UninstallProvider(removed[0])
     } else if removed.is_empty() {
-        LifecycleIntent::UninstallAll
+        LifecycleRequest::UninstallAll
     } else {
         return Envelope::usage(
             Some("uninstall"),
@@ -438,12 +401,17 @@ fn run_uninstall(
         Err(envelope) => return *envelope,
     };
     // Uninstall never adopts, so it takes no legacy proof.
-    let transition =
-        match prepare_lifecycle_transition(catalog, &roots, current.as_ref(), &intent, None) {
-            Ok(transition) => transition,
-            Err(error) => return lifecycle_error("uninstall", managed, error.to_string()),
-        };
-    apply_transition(
+    let decision = match decide(
+        catalog,
+        &roots,
+        current.as_ref(),
+        &request,
+        &LegacyEvidence::Absent,
+    ) {
+        Ok(decision) => decision,
+        Err(error) => return lifecycle_error("uninstall", managed, error.to_string()),
+    };
+    apply_decision(
         ApplyRequest {
             catalog,
             cli,
@@ -455,7 +423,7 @@ fn run_uninstall(
             legacy_import: None,
         },
         roots,
-        transition,
+        decision,
     )
 }
 
@@ -480,31 +448,26 @@ fn run_adopt(
         Ok(context) => context,
         Err(envelope) => return *envelope,
     };
-    let legacy_import = match legacy_import_plan(catalog, &roots) {
-        Ok(legacy) => legacy,
-        Err(message) => return lifecycle_error("adopt", providers, message),
+    let legacy_import = legacy_import_plan(catalog, &roots);
+    let legacy = legacy_evidence(&legacy_import);
+    let request = LifecycleRequest::Adopt {
+        providers: providers.clone(),
     };
-    let transition = match prepare_lifecycle_transition(
-        catalog,
-        &roots,
-        current.as_ref(),
-        &LifecycleIntent::Install {
-            providers: providers.clone(),
-        },
-        legacy_import.as_ref(),
-    ) {
-        Ok(transition) => transition,
+    let decision = match decide(catalog, &roots, current.as_ref(), &request, &legacy) {
+        Ok(decision) => decision,
         Err(error) => return lifecycle_error("adopt", providers, error.to_string()),
     };
-    let entries = match adoption_entries(&transition, &roots) {
+    if !decision.applicable() {
+        return report_decision("adopt", decision);
+    }
+    let entries = match adoption_entries(&decision, &roots) {
         Ok(entries) => entries,
         Err(message) => return lifecycle_error("adopt", providers, message),
     };
     if entries.is_empty() {
         // Only verified legacy candidates are in scope for adopt. Catalog
         // collisions without proof belong to a reconcile request.
-        let mut envelope =
-            Envelope::new(Some("adopt")).with_plan(&adoption_scoped_plan(&transition.plan, true));
+        let mut envelope = Envelope::new(Some("adopt")).with_plan(&decision.plan);
         envelope.providers = providers;
         envelope.status = OutputStatus::Noop;
         envelope.exit_code = 0;
@@ -520,7 +483,10 @@ fn run_adopt(
         Ok(adoption) => adoption,
         Err(error) => return lifecycle_error("adopt", providers, error.to_string()),
     };
-    let adoption_plan = adoption_scoped_plan(&transition.plan, adoption.applicable);
+    let adoption_plan = plan::Plan {
+        applicable: adoption.applicable,
+        ..decision.plan.clone()
+    };
     let mut envelope = Envelope::new(Some("adopt")).with_plan(&adoption_plan);
     envelope.providers.clone_from(&providers);
     if adoption.applicable {
@@ -541,6 +507,7 @@ fn run_adopt(
                 code: format!("{:?}", diagnostic.code).to_ascii_lowercase(),
                 severity: OutputSeverity::Error,
                 message,
+                source_id: diagnostic.source_id.clone(),
                 path_utf8,
                 path_bytes_hex,
                 remediation: Some(
@@ -563,11 +530,7 @@ fn run_adopt(
             );
         }
         let mut app = App::with_selection(catalog.skill_count(), &providers);
-        app.set_review(Review::from_plan(
-            &adoption_plan,
-            &transition.notices,
-            &roots,
-        ));
+        app.set_review(Review::from_decision(&decision, &roots));
         let decision = match presentation {
             Presentation::Tui => ui::confirm_plan(app, signals).map(|exit| match exit {
                 UiExit::Confirmed => PlainExit::Confirmed,
@@ -714,10 +677,10 @@ fn run_recover(catalog: &Catalog, signals: &SignalFlags) -> Envelope {
     }
 }
 
-fn apply_transition(
+fn apply_decision(
     request: ApplyRequest<'_>,
     roots: ResolvedRoots,
-    transition: LifecycleTransition,
+    decision: LifecycleDecision,
 ) -> Envelope {
     let ApplyRequest {
         catalog,
@@ -729,7 +692,7 @@ fn apply_transition(
         assessment,
         legacy_import,
     } = request;
-    let mut envelope = report_transition(command, transition.clone());
+    let mut envelope = report_decision(command, decision.clone());
     if confirmation.dry_run {
         if let Some(legacy) = legacy_import {
             envelope.data = json!({
@@ -740,12 +703,9 @@ fn apply_transition(
         }
         return envelope;
     }
-    let already_current = legacy_import.is_none()
-        && transition
-            .plan
-            .entries
-            .iter()
-            .all(|entry| entry.action == plan::PlanAction::Noop);
+    // The decision owns this verdict: a receipt that must converge is never
+    // reported as already current, even when every asset already matches.
+    let already_current = legacy_import.is_none() && decision.is_current();
     if already_current && (assessment.is_none() || presentation == Presentation::NonInteractive) {
         envelope.status = OutputStatus::Noop;
         envelope.data = json!({
@@ -762,17 +722,12 @@ fn apply_transition(
                 "non-interactive mutation requires --yes after reviewing the plan",
             );
         }
-        let mut app = App::with_selection(catalog.skill_count(), &transition.selected_providers);
+        let mut app = App::with_selection(catalog.skill_count(), &decision.selected_providers);
         app.set_review(match assessment {
-            Some(assessment) => Review::for_workflow(
-                &transition.plan,
-                &transition.notices,
-                &roots,
-                assessment.clone(),
-            ),
-            None => Review::from_plan(&transition.plan, &transition.notices, &roots),
+            Some(assessment) => Review::for_decision(&decision, &roots, assessment.clone()),
+            None => Review::from_decision(&decision, &roots),
         });
-        let decision = match presentation {
+        let confirmation_exit = match presentation {
             Presentation::Tui => ui::confirm_plan(app, signals).map(|exit| match exit {
                 UiExit::Confirmed => PlainExit::Confirmed,
                 UiExit::Interrupted(code) => PlainExit::Interrupted(code),
@@ -786,7 +741,7 @@ fn apply_transition(
             ),
             Presentation::NonInteractive => unreachable!(),
         };
-        match decision {
+        match confirmation_exit {
             Ok(PlainExit::Confirmed) => {
                 envelope.suppress_human_output =
                     already_current && presentation == Presentation::Tui;
@@ -794,7 +749,7 @@ fn apply_transition(
             Ok(PlainExit::Interrupted(code)) => {
                 return transaction_error(
                     command,
-                    transition.selected_providers,
+                    decision.selected_providers,
                     code,
                     "interrupted before mutation".to_owned(),
                 );
@@ -808,14 +763,14 @@ fn apply_transition(
             Err(error) => {
                 return transaction_error(
                     command,
-                    transition.selected_providers,
+                    decision.selected_providers,
                     TRANSACTION_EXIT_CODE,
                     error.to_string(),
                 );
             }
         }
     }
-    if !transition.plan.applicable {
+    if !decision.applicable() {
         return envelope;
     }
     if already_current {
@@ -833,7 +788,7 @@ fn apply_transition(
         Err(message) => {
             return transaction_error(
                 command,
-                transition.selected_providers,
+                decision.selected_providers,
                 TRANSACTION_EXIT_CODE,
                 message,
             );
@@ -841,27 +796,22 @@ fn apply_transition(
     };
     let operations_result = if legacy_import.is_some() {
         operations_for_import(
-            &transition.plan,
+            &decision.plan,
             &roots.legacy_lock_path,
             legacy_import,
             &roots,
-            &transition.receipt,
+            &decision.receipt,
             &transaction_id,
         )
     } else {
-        operations_for_plan(
-            &transition.plan,
-            &roots,
-            &transition.receipt,
-            &transaction_id,
-        )
+        operations_for_plan(&decision.plan, &roots, &decision.receipt, &transaction_id)
     };
     let operations = match operations_result {
         Ok(operations) => operations,
         Err(error) => {
             return transaction_error(
                 command,
-                transition.selected_providers,
+                decision.selected_providers,
                 TRANSACTION_EXIT_CODE,
                 error.to_string(),
             );
@@ -872,7 +822,7 @@ fn apply_transition(
     {
         return transaction_error(
             command,
-            transition.selected_providers,
+            decision.selected_providers,
             TRANSACTION_EXIT_CODE,
             error.to_string(),
         );
@@ -886,13 +836,13 @@ fn apply_transition(
         }
         Ok(outcome) => transaction_error(
             command,
-            transition.selected_providers,
+            decision.selected_providers,
             TRANSACTION_EXIT_CODE,
             format!("unexpected apply outcome: {outcome:?}"),
         ),
         Err(error) => transaction_error(
             command,
-            transition.selected_providers,
+            decision.selected_providers,
             error.exit_code(),
             error.to_string(),
         ),
@@ -971,51 +921,13 @@ fn providers_or_interactive(
     }
 }
 
-/// Restricts a reconcile plan to the verified legacy candidates `adopt` owns.
-///
-/// Unproven catalog collisions are evaluated by a reconcile request, so they
-/// must not turn `adopt` into a blocked command or leak their diagnostics here.
-fn adoption_scoped_plan(source: &plan::Plan, applicable: bool) -> plan::Plan {
-    let entries = source
-        .entries
-        .iter()
-        .filter(|entry| entry.action == plan::PlanAction::Adoptable)
-        .cloned()
-        .collect::<Vec<_>>();
-    let destinations = entries
-        .iter()
-        .map(|entry| entry.destination.as_path())
-        .collect::<BTreeSet<_>>();
-    plan::Plan {
-        schema_version: source.schema_version,
-        applicable,
-        diagnostics: source
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| {
-                diagnostic
-                    .path_utf8
-                    .as_deref()
-                    .is_some_and(|path| destinations.contains(Path::new(path)))
-            })
-            .cloned()
-            .collect(),
-        entries,
-        operations: Vec::new(),
-    }
-}
-
+/// Builds the verified adoption entries from the decision's candidates.
 fn adoption_entries(
-    transition: &LifecycleTransition,
+    decision: &LifecycleDecision,
     roots: &ResolvedRoots,
 ) -> Result<Vec<CatalogEntry>, String> {
     let mut entries = Vec::new();
-    for entry in transition
-        .plan
-        .entries
-        .iter()
-        .filter(|entry| entry.action == plan::PlanAction::Adoptable)
-    {
+    for entry in decision.adoption_candidates() {
         let Some(source_id) = adoption_source_id(&entry.destination, roots) else {
             continue;
         };
@@ -1217,22 +1129,21 @@ fn environment_error(command: &str, error: &ResolveError) -> Envelope {
     envelope
 }
 
-fn report_transition(command: &str, transition: LifecycleTransition) -> Envelope {
-    let mut envelope = Envelope::new(Some(command)).with_plan(&transition.plan);
-    envelope.providers = transition.selected_providers;
-    envelope.diagnostics.extend(
-        transition
-            .notices
-            .into_iter()
-            .map(|notice| OutputDiagnostic {
-                code: notice.code.as_str().to_owned(),
-                severity: OutputSeverity::Warning,
-                message: notice.message,
-                path_utf8: None,
-                path_bytes_hex: None,
-                remediation: None,
-            }),
-    );
+/// Projects the decision into the public envelope without reclassifying it.
+fn report_decision(command: &str, decision: LifecycleDecision) -> Envelope {
+    let mut envelope = Envelope::new(Some(command)).with_plan(&decision.plan);
+    envelope.providers = decision.selected_providers;
+    envelope
+        .diagnostics
+        .extend(decision.notices.into_iter().map(|notice| OutputDiagnostic {
+            code: notice.code.as_str().to_owned(),
+            severity: OutputSeverity::Warning,
+            message: notice.message,
+            source_id: None,
+            path_utf8: None,
+            path_bytes_hex: None,
+            remediation: None,
+        }));
     envelope
 }
 
@@ -1331,9 +1242,9 @@ mod tests {
         Presentation, adoption_entries, adoption_source_id, cancelled, compare_cli_versions,
         environment_error, lifecycle_error, recovery_required, transaction_error, trusted_roots,
     };
-    use crate::lifecycle::LifecycleTransition;
+    use crate::lifecycle::{LifecycleDecision, LifecycleRequest, ReceiptChange};
     use crate::output::OutputStatus;
-    use crate::plan::{Owner, OwnershipClaim, Plan, PlanAction, PlanEntry};
+    use crate::plan::{Owner, OwnershipClaim, Plan, PlanAction, PlanEntry, PlanReason};
     use crate::provider::{PathDiagnostic, ProviderId, ResolveError, resolve_roots_from};
     use crate::receipt::Receipt;
     use crate::should_use_tui;
@@ -1441,28 +1352,34 @@ mod tests {
         assert_eq!(trusted_roots(&roots).len(), 3);
 
         let destination = roots.canonical_skills.join("missing/SKILL.md");
-        let transition = LifecycleTransition {
-            selected_providers: vec![ProviderId::Claude],
-            plan: Plan {
-                schema_version: 1,
-                applicable: true,
-                entries: vec![PlanEntry {
-                    action: PlanAction::Adoptable,
-                    source: "skills/missing/SKILL.md".to_owned(),
-                    destination,
-                    owner: Owner::Unmanaged,
-                    reason: "matching unmanaged asset".to_owned(),
-                    ownership: OwnershipClaim::None,
-                }],
-                operations: Vec::new(),
-                diagnostics: Vec::new(),
+        let plan = Plan {
+            schema_version: 1,
+            applicable: true,
+            entries: vec![PlanEntry {
+                action: PlanAction::Adoptable,
+                source: "skills/missing/SKILL.md".to_owned(),
+                destination,
+                owner: Owner::Unmanaged,
+                reason: PlanReason::VerifiedLegacyAdoption,
+                ownership: OwnershipClaim::None,
+            }],
+            operations: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let summary = plan.summary();
+        let decision = LifecycleDecision {
+            request: LifecycleRequest::Adopt {
+                providers: vec![ProviderId::Claude],
             },
+            selected_providers: vec![ProviderId::Claude],
+            plan,
             receipt: Receipt::new("0.1.0", "hash", &roots),
+            receipt_change: ReceiptChange::default(),
             notices: Vec::new(),
+            summary,
         };
         assert!(
-            adoption_entries(&transition, &roots)
-                .is_err_and(|error| error.contains("changed type"))
+            adoption_entries(&decision, &roots).is_err_and(|error| error.contains("changed type"))
         );
         Ok(())
     }

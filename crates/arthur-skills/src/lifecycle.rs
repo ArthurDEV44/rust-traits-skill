@@ -10,8 +10,9 @@ use crate::adoption::LegacyImportPlan;
 use crate::catalog::{AssetKind, Catalog, Provider as CatalogProvider};
 use crate::engine::{EngineError, plan_desired_state_with_removal_policy};
 use crate::plan::{
-    DesiredAsset, DesiredPayload, LegacyOwnership, LegacyProofScope, Plan, PlanAction,
-    RemovalPolicy,
+    DesiredAsset, DesiredPayload, Diagnostic, LegacyOwnership, LegacyProofScope, MutationKind,
+    OwnershipClaim, OwnershipProof, PLAN_SCHEMA_VERSION, Plan, PlanAction, PlanEntry, PlanReason,
+    PlanSummary, PlannedInverse, PlannedMutation, Precondition, RemovalPolicy, inspect_snapshot,
 };
 use crate::provider::{ProviderId, ProviderRegistry, ResolvedProvider, ResolvedRoots};
 use crate::receipt::{OwnedAsset, OwnedAssetKind, Receipt, ReceiptError, RetainedUnmanagedAsset};
@@ -19,12 +20,148 @@ use crate::transaction::{PathKind, snapshot_path};
 
 const DIRECTORY_MODE: u32 = 0o755;
 const LEGACY_IMPORT_ENTRY_LIMIT: usize = 100_000;
+const RECEIPT_SOURCE_ID: &str = "receipt:v1";
+const RECEIPT_MODE: u32 = 0o600;
+/// Stable identifier of the receipt mutation. The executor writes the receipt
+/// last, so its identifier sorts after every filesystem operation.
+pub const WRITE_RECEIPT_OPERATION_ID: &str = "zzzzzzzz-write-receipt";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LifecycleIntent {
-    Install { providers: Vec<ProviderId> },
+/// Diagnostic codes a blocked decision can carry.
+pub const UNSAFE_CONTAINER: &str = "unsafe_container";
+pub const RECEIPT_UNREADABLE: &str = "receipt_unreadable";
+pub const LEGACY_LOCK_UNSUPPORTED: &str = "legacy_lock_unsupported";
+
+/// The typed request every lifecycle surface starts from.
+///
+/// One request plus one observed state produces exactly one decision, so no
+/// command can select a competing transition after the plan was rendered.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "request")]
+pub enum LifecycleRequest {
+    /// Converge the desired catalog without claiming any unproven destination.
+    Reconcile {
+        providers: Vec<ProviderId>,
+    },
+    /// Transfer a verified Vercel Skills v3 installation that has no receipt.
+    Import {
+        providers: Vec<ProviderId>,
+    },
+    /// Adopt only the destinations a verified v3 lock entry proves.
+    Adopt {
+        providers: Vec<ProviderId>,
+    },
     UninstallProvider(ProviderId),
     UninstallAll,
+}
+
+impl LifecycleRequest {
+    #[must_use]
+    pub fn providers(&self) -> Vec<ProviderId> {
+        match self {
+            Self::Reconcile { providers } | Self::Import { providers } => providers.clone(),
+            Self::Adopt { providers } => providers.clone(),
+            Self::UninstallProvider(_) | Self::UninstallAll => Vec::new(),
+        }
+    }
+
+    const fn is_uninstall(&self) -> bool {
+        matches!(self, Self::UninstallProvider(_) | Self::UninstallAll)
+    }
+}
+
+/// What the shared read-only inspection of the legacy lock proved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LegacyEvidence<'a> {
+    /// No lock, or no catalog entry inside it.
+    Absent,
+    /// A verified v3 lock: every entry it names can prove its own destinations.
+    Verified(&'a LegacyImportPlan),
+    /// The lock exists but this CLI cannot verify it.
+    Unsupported { detail: String },
+}
+
+impl<'a> LegacyEvidence<'a> {
+    #[must_use]
+    pub const fn verified(&self) -> Option<&'a LegacyImportPlan> {
+        match self {
+            Self::Verified(plan) => Some(plan),
+            Self::Absent | Self::Unsupported { .. } => None,
+        }
+    }
+}
+
+impl<'a> From<Option<&'a LegacyImportPlan>> for LegacyEvidence<'a> {
+    fn from(plan: Option<&'a LegacyImportPlan>) -> Self {
+        plan.map_or(Self::Absent, Self::Verified)
+    }
+}
+
+/// Why the projected receipt differs from the recorded one.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptChangeReason {
+    NoCurrentReceipt,
+    CliVersion,
+    CatalogVersion,
+    Roots,
+    Providers,
+    Assets,
+    RetainedUnmanaged,
+    State,
+    FilesystemMutations,
+    /// A verified legacy lock is archived and rewritten by this transaction, and
+    /// every transaction commits exactly one receipt.
+    LegacyLockRewrite,
+}
+
+/// Control-plane convergence of the decision.
+///
+/// A receipt whose only difference is the identifier allocated at commit time is
+/// semantically current, so it must not produce a mutation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ReceiptChange {
+    pub required: bool,
+    pub reasons: Vec<ReceiptChangeReason>,
+}
+
+/// The single artefact every surface consumes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LifecycleDecision {
+    pub request: LifecycleRequest,
+    pub selected_providers: Vec<ProviderId>,
+    pub plan: Plan,
+    /// Receipt projected by this decision; only proven destinations appear in it.
+    pub receipt: Receipt,
+    pub receipt_change: ReceiptChange,
+    pub notices: Vec<LifecycleNotice>,
+    pub summary: PlanSummary,
+}
+
+impl LifecycleDecision {
+    #[must_use]
+    pub const fn applicable(&self) -> bool {
+        self.plan.applicable
+    }
+
+    /// True when nothing on disk and nothing in the receipt has to change.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.plan.operations.is_empty()
+            && !self.receipt_change.required
+            && self
+                .plan
+                .entries
+                .iter()
+                .all(|entry| entry.action == PlanAction::Noop)
+    }
+
+    /// The verified legacy candidates, the only paths `adopt` may transfer.
+    pub fn adoption_candidates(&self) -> impl Iterator<Item = &PlanEntry> {
+        self.plan
+            .entries
+            .iter()
+            .filter(|entry| entry.action == PlanAction::Adoptable)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -53,14 +190,6 @@ impl LifecycleNoticeCode {
 pub struct LifecycleNotice {
     pub code: LifecycleNoticeCode,
     pub message: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LifecycleTransition {
-    pub selected_providers: Vec<ProviderId>,
-    pub plan: Plan,
-    pub receipt: Receipt,
-    pub notices: Vec<LifecycleNotice>,
 }
 
 #[derive(Debug)]
@@ -165,20 +294,93 @@ fn legacy_ownership(roots: &ResolvedRoots, legacy: Option<&LegacyImportPlan>) ->
     LegacyOwnership::new(scopes)
 }
 
-pub fn prepare_lifecycle_transition(
+/// Builds the one decision every surface consumes.
+///
+/// An unverifiable receipt, an unsupported legacy lock or a failed filesystem
+/// inspection produce a complete blocked decision instead of an alternative
+/// transition, so no command can fall back to a partial plan.
+pub fn decide(
     catalog: &Catalog,
     roots: &ResolvedRoots,
     current: Option<&Receipt>,
-    intent: &LifecycleIntent,
+    request: &LifecycleRequest,
+    legacy: &LegacyEvidence<'_>,
+) -> Result<LifecycleDecision, LifecycleError> {
+    if let LegacyEvidence::Unsupported { detail } = legacy {
+        return Ok(blocked_decision(
+            catalog,
+            roots,
+            request,
+            Diagnostic::path_error(
+                LEGACY_LOCK_UNSUPPORTED,
+                detail.clone(),
+                &roots.legacy_lock_path,
+            ),
+        ));
+    }
+    match build_decision(catalog, roots, current, request, legacy.verified()) {
+        Ok(decision) => Ok(decision),
+        Err(LifecycleError::UnsafeContainer { path, detail }) => Ok(blocked_decision(
+            catalog,
+            roots,
+            request,
+            Diagnostic::path_error(UNSAFE_CONTAINER, detail, &path),
+        )),
+        Err(
+            LifecycleError::Receipt(error) | LifecycleError::Engine(EngineError::Receipt(error)),
+        ) => Ok(blocked_decision(
+            catalog,
+            roots,
+            request,
+            Diagnostic::path_error(RECEIPT_UNREADABLE, error.to_string(), &roots.receipt_path),
+        )),
+        Err(other) => Err(other),
+    }
+}
+
+/// A complete decision that can never be applied and claims nothing.
+fn blocked_decision(
+    catalog: &Catalog,
+    roots: &ResolvedRoots,
+    request: &LifecycleRequest,
+    diagnostic: Diagnostic,
+) -> LifecycleDecision {
+    let plan = Plan {
+        schema_version: PLAN_SCHEMA_VERSION,
+        applicable: false,
+        entries: Vec::new(),
+        operations: Vec::new(),
+        diagnostics: vec![diagnostic],
+    };
+    let summary = plan.summary();
+    LifecycleDecision {
+        request: request.clone(),
+        selected_providers: request.providers(),
+        receipt: Receipt::new(
+            env!("CARGO_PKG_VERSION"),
+            &catalog.manifest().catalog_sha256,
+            roots,
+        ),
+        plan,
+        receipt_change: ReceiptChange::default(),
+        notices: Vec::new(),
+        summary,
+    }
+}
+
+fn build_decision(
+    catalog: &Catalog,
+    roots: &ResolvedRoots,
+    current: Option<&Receipt>,
+    request: &LifecycleRequest,
     legacy: Option<&LegacyImportPlan>,
-) -> Result<LifecycleTransition, LifecycleError> {
+) -> Result<LifecycleDecision, LifecycleError> {
     if let Some(receipt) = current {
         receipt.validate()?;
         receipt.validate_roots(roots)?;
     }
-
     let current_providers = managed_providers(current);
-    let selected_providers = selected_after(intent, &current_providers)?;
+    let selected_providers = selected_after(request, &current_providers)?;
     let required_roots = current_providers
         .iter()
         .chain(selected_providers.iter())
@@ -191,63 +393,92 @@ pub fn prepare_lifecycle_transition(
     }
 
     let managed = build_desired(catalog, roots, current, &selected_providers)?;
+    let proofs = legacy_ownership(roots, legacy);
+    // Only an import may seed a baseline from verified legacy proofs. Every
+    // other request keeps the recorded receipt as its sole prior ownership.
+    let baseline = match request {
+        LifecycleRequest::Import { .. } => Some(import_baseline(
+            catalog,
+            roots,
+            &selected_providers,
+            &managed,
+            &proofs,
+            legacy,
+        )?),
+        _ => current.cloned(),
+    };
     let desired = managed
         .values()
         .map(|entry| entry.asset.clone())
         .collect::<Vec<_>>();
-    let removal_policy = if matches!(
-        intent,
-        LifecycleIntent::UninstallProvider(_) | LifecycleIntent::UninstallAll
-    ) {
+    let removal_policy = if request.is_uninstall() {
         RemovalPolicy::RetainUnmanaged
     } else {
         RemovalPolicy::BlockOnDrift
     };
-    let plan = plan_desired_state_with_removal_policy(
+    let mut plan = plan_desired_state_with_removal_policy(
         roots,
-        current,
+        baseline.as_ref(),
         &desired,
-        &legacy_ownership(roots, legacy),
+        &proofs,
         removal_policy,
     )?;
-    let receipt = build_receipt(
+    let mut receipt = build_receipt(
         catalog,
         roots,
-        current,
+        baseline.as_ref(),
         &selected_providers,
         &managed,
         &plan,
     )?;
     let notices = lifecycle_notices(
-        intent,
+        request,
         &current_providers,
         &selected_providers,
         &plan,
         roots,
     );
 
-    Ok(LifecycleTransition {
+    if matches!(request, LifecycleRequest::Adopt { .. }) {
+        // `adopt` owns the verified candidates only. Unproven collisions are
+        // evaluated by a reconcile request and must not block this command.
+        // The transfer itself claims each verified entry after the lock is
+        // reverified, so this decision projects the recorded receipt unchanged.
+        plan = adoption_scoped_plan(&plan);
+        receipt = current.cloned().unwrap_or_else(|| {
+            Receipt::new(
+                env!("CARGO_PKG_VERSION"),
+                &catalog.manifest().catalog_sha256,
+                roots,
+            )
+        });
+    }
+
+    let receipt_change = receipt_change(current, &receipt, &plan, request, legacy.is_some());
+    if receipt_change.required {
+        push_receipt_convergence(&mut plan, roots)?;
+    }
+    let summary = plan.summary();
+    Ok(LifecycleDecision {
+        request: request.clone(),
         selected_providers,
         plan,
         receipt,
+        receipt_change,
         notices,
+        summary,
     })
 }
 
-pub fn prepare_import_transition(
+/// Seeds an import baseline from verified legacy proofs only.
+fn import_baseline(
     catalog: &Catalog,
     roots: &ResolvedRoots,
-    providers: &[ProviderId],
+    selected_providers: &[ProviderId],
+    managed: &BTreeMap<PathBuf, ManagedDesired>,
+    proofs: &LegacyOwnership,
     legacy: Option<&LegacyImportPlan>,
-) -> Result<LifecycleTransition, LifecycleError> {
-    let selected_providers = selected_after(
-        &LifecycleIntent::Install {
-            providers: providers.to_vec(),
-        },
-        &[],
-    )?;
-    require_provider_roots(roots, &selected_providers)?;
-    let managed = build_desired(catalog, roots, None, &selected_providers)?;
+) -> Result<Receipt, LifecycleError> {
     let mut baseline = Receipt::new(
         env!("CARGO_PKG_VERSION"),
         &catalog.manifest().catalog_sha256,
@@ -256,10 +487,6 @@ pub fn prepare_import_transition(
     for provider in &mut baseline.providers {
         provider.managed_integration = selected_providers.contains(&provider.provider);
     }
-    // Only a verified v3 lock entry can seed a baseline without a prior
-    // receipt. Every other observed destination stays unproven, so the planner
-    // classifies it instead of the import silently claiming it.
-    let proofs = legacy_ownership(roots, legacy);
     for entry in managed.values() {
         if proofs.proof_for(&entry.asset.destination).is_none() {
             continue;
@@ -277,7 +504,7 @@ pub fn prepare_import_transition(
             collect_legacy_skill(
                 &roots.canonical_skills.join(name),
                 name,
-                &selected_providers,
+                selected_providers,
                 &mut baseline.assets,
             )?;
         }
@@ -286,125 +513,183 @@ pub fn prepare_import_transition(
         .assets
         .sort_by(|left, right| left.destination.cmp(&right.destination));
     baseline.validate()?;
-
-    transition_from_baseline(
-        catalog,
-        roots,
-        &baseline,
-        &selected_providers,
-        managed,
-        &proofs,
-    )
+    Ok(baseline)
 }
 
-pub fn prepare_reconciliation_transition(
-    catalog: &Catalog,
-    roots: &ResolvedRoots,
+/// Restricts a decision to the verified legacy candidates `adopt` owns.
+fn adoption_scoped_plan(source: &Plan) -> Plan {
+    let entries = source
+        .entries
+        .iter()
+        .filter(|entry| entry.action == PlanAction::Adoptable)
+        .cloned()
+        .collect::<Vec<_>>();
+    let destinations = entries
+        .iter()
+        .map(|entry| entry.destination.as_path())
+        .collect::<BTreeSet<_>>();
+    Plan {
+        schema_version: source.schema_version,
+        applicable: true,
+        diagnostics: source
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .path_utf8
+                    .as_deref()
+                    .is_some_and(|path| destinations.contains(Path::new(path)))
+            })
+            .cloned()
+            .collect(),
+        entries,
+        operations: Vec::new(),
+    }
+}
+
+/// Compares the projected receipt with the recorded one.
+///
+/// Only the identifier allocated at commit time is volatile, so every other
+/// difference is a real convergence the plan must show.
+fn receipt_change(
+    current: Option<&Receipt>,
+    projected: &Receipt,
+    plan: &Plan,
+    request: &LifecycleRequest,
+    legacy_lock_rewrite: bool,
+) -> ReceiptChange {
+    if matches!(request, LifecycleRequest::Adopt { .. }) || !plan.applicable {
+        return ReceiptChange::default();
+    }
+    let mut reasons = match current {
+        None => vec![ReceiptChangeReason::NoCurrentReceipt],
+        Some(current) => semantic_receipt_differences(current, projected),
+    };
+    if plan.has_mutations() {
+        reasons.push(ReceiptChangeReason::FilesystemMutations);
+    }
+    if legacy_lock_rewrite {
+        reasons.push(ReceiptChangeReason::LegacyLockRewrite);
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    ReceiptChange {
+        required: !reasons.is_empty(),
+        reasons,
+    }
+}
+
+fn semantic_receipt_differences(
     current: &Receipt,
-    providers: &[ProviderId],
-    legacy: Option<&LegacyImportPlan>,
-) -> Result<LifecycleTransition, LifecycleError> {
-    current.validate()?;
-    current.validate_roots(roots)?;
-    let selected_providers = selected_after(
-        &LifecycleIntent::Install {
-            providers: providers.to_vec(),
-        },
-        &managed_providers(Some(current)),
-    )?;
-    require_provider_roots(roots, &selected_providers)?;
-    let managed = build_desired(catalog, roots, Some(current), &selected_providers)?;
-    let mut baseline = current.clone();
-    let mut observed = current
+    projected: &Receipt,
+) -> Vec<ReceiptChangeReason> {
+    let mut reasons = Vec::new();
+    if current.cli_version != projected.cli_version {
+        reasons.push(ReceiptChangeReason::CliVersion);
+    }
+    if current.catalog_sha256 != projected.catalog_sha256 {
+        reasons.push(ReceiptChangeReason::CatalogVersion);
+    }
+    if current.roots != projected.roots {
+        reasons.push(ReceiptChangeReason::Roots);
+    }
+    if current.providers != projected.providers {
+        reasons.push(ReceiptChangeReason::Providers);
+    }
+    if !owned_assets_equal(current, projected) {
+        reasons.push(ReceiptChangeReason::Assets);
+    }
+    if !retained_equal(current, projected) {
+        reasons.push(ReceiptChangeReason::RetainedUnmanaged);
+    }
+    if current.state != projected.state {
+        reasons.push(ReceiptChangeReason::State);
+    }
+    reasons
+}
+
+fn owned_assets_equal(current: &Receipt, projected: &Receipt) -> bool {
+    let left = current
         .assets
         .iter()
-        .map(|asset| observed_owned_asset(&asset.source_id, &asset.destination, &asset.references))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .map(|asset| (asset.destination.clone(), asset))
+        .map(|asset| (asset.destination.as_path(), asset))
         .collect::<BTreeMap<_, _>>();
-    let proofs = legacy_ownership(roots, legacy);
-    for entry in managed.values() {
-        if proofs.proof_for(&entry.asset.destination).is_some()
-            && !observed.contains_key(&entry.asset.destination)
-            && let Some(asset) = observed_owned_asset(
-                &entry.asset.source_id,
-                &entry.asset.destination,
-                &entry.references,
-            )?
-        {
-            // The v3 lock proves legacy ownership. Recording the observed
-            // state lets the planner update an older catalog version safely.
-            observed.insert(asset.destination.clone(), asset);
-        }
-    }
-    baseline.assets = observed.into_values().collect();
-    baseline.validate()?;
-
-    transition_from_baseline(
-        catalog,
-        roots,
-        &baseline,
-        &selected_providers,
-        managed,
-        &proofs,
-    )
+    let right = projected
+        .assets
+        .iter()
+        .map(|asset| (asset.destination.as_path(), asset))
+        .collect::<BTreeMap<_, _>>();
+    left == right
 }
 
-fn transition_from_baseline(
-    catalog: &Catalog,
-    roots: &ResolvedRoots,
-    baseline: &Receipt,
-    selected_providers: &[ProviderId],
-    managed: BTreeMap<PathBuf, ManagedDesired>,
-    legacy: &LegacyOwnership,
-) -> Result<LifecycleTransition, LifecycleError> {
-    let desired = managed
-        .values()
-        .map(|entry| entry.asset.clone())
-        .collect::<Vec<_>>();
-    let plan = plan_desired_state_with_removal_policy(
-        roots,
-        Some(baseline),
-        &desired,
-        legacy,
-        RemovalPolicy::BlockOnDrift,
-    )?;
-    let receipt = build_receipt(
-        catalog,
-        roots,
-        Some(baseline),
-        selected_providers,
-        &managed,
-        &plan,
-    )?;
-    let notices = lifecycle_notices(
-        &LifecycleIntent::Install {
-            providers: selected_providers.to_vec(),
-        },
-        &managed_providers(Some(baseline)),
-        selected_providers,
-        &plan,
-        roots,
-    );
-    Ok(LifecycleTransition {
-        selected_providers: selected_providers.to_vec(),
-        plan,
-        receipt,
-        notices,
-    })
+fn retained_equal(current: &Receipt, projected: &Receipt) -> bool {
+    let left = current
+        .retained_unmanaged
+        .iter()
+        .map(|entry| (entry.destination.as_path(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let right = projected
+        .retained_unmanaged
+        .iter()
+        .map(|entry| (entry.destination.as_path(), entry))
+        .collect::<BTreeMap<_, _>>();
+    left == right
 }
 
-fn require_provider_roots(
+/// Represents the receipt commit in the same plan as the filesystem changes.
+///
+/// The executor commits the receipt only when the plan carries this marker, so a
+/// semantically current receipt is never rewritten.
+pub fn push_receipt_convergence(
+    plan: &mut Plan,
     roots: &ResolvedRoots,
-    providers: &[ProviderId],
 ) -> Result<(), LifecycleError> {
-    for provider in providers {
-        if roots.provider(*provider).is_none() {
-            return Err(LifecycleError::MissingProviderRoot(*provider));
+    let snapshot =
+        inspect_snapshot(&roots.receipt_path).map_err(|error| LifecycleError::UnsafeContainer {
+            path: roots.receipt_path.clone(),
+            detail: error.to_string(),
+        })?;
+    let (precondition, inverse, ownership) = match snapshot {
+        None => (
+            Precondition::Missing,
+            PlannedInverse::RemoveCreated,
+            OwnershipProof::UnownedDestination,
+        ),
+        Some(snapshot) => {
+            let ownership = OwnershipProof::Receipt {
+                source_id: RECEIPT_SOURCE_ID.to_owned(),
+                sha256: snapshot.sha256.clone(),
+            };
+            (
+                Precondition::Matches { snapshot },
+                PlannedInverse::RestoreBackup,
+                ownership,
+            )
         }
-    }
+    };
+    plan.entries.push(PlanEntry::new(
+        PlanAction::WriteReceipt,
+        RECEIPT_SOURCE_ID,
+        roots.receipt_path.clone(),
+        crate::plan::Owner::ArthurWorkflow,
+        PlanReason::ReceiptConvergence,
+        OwnershipClaim::CreatedInTransaction {
+            operation_id: WRITE_RECEIPT_OPERATION_ID.to_owned(),
+        },
+    ));
+    plan.operations.push(PlannedMutation {
+        id: WRITE_RECEIPT_OPERATION_ID.to_owned(),
+        kind: MutationKind::WriteReceipt,
+        root: roots.canonical.lexical.clone(),
+        destination: roots.receipt_path.clone(),
+        precondition,
+        inverse,
+        ownership,
+        content_sha256: None,
+        mode: Some(RECEIPT_MODE),
+        link_target: None,
+        payload: None,
+    });
     Ok(())
 }
 
@@ -541,22 +826,24 @@ fn managed_providers(receipt: Option<&Receipt>) -> Vec<ProviderId> {
 }
 
 fn selected_after(
-    intent: &LifecycleIntent,
+    request: &LifecycleRequest,
     current: &[ProviderId],
 ) -> Result<Vec<ProviderId>, LifecycleError> {
-    let selected = match intent {
-        LifecycleIntent::Install { providers } => {
+    let selected = match request {
+        LifecycleRequest::Reconcile { providers }
+        | LifecycleRequest::Import { providers }
+        | LifecycleRequest::Adopt { providers } => {
             if providers.is_empty() {
                 return Err(LifecycleError::EmptyProviderSelection);
             }
             providers.iter().copied().collect::<BTreeSet<_>>()
         }
-        LifecycleIntent::UninstallProvider(removed) => current
+        LifecycleRequest::UninstallProvider(removed) => current
             .iter()
             .copied()
             .filter(|provider| provider != removed)
             .collect(),
-        LifecycleIntent::UninstallAll => BTreeSet::new(),
+        LifecycleRequest::UninstallAll => BTreeSet::new(),
     };
     Ok(selected.into_iter().collect())
 }
@@ -1021,10 +1308,14 @@ fn build_receipt(
     // A projected receipt may only claim destinations the plan proved. A
     // conflicting or unproven path is never written as owned, whatever its
     // name or bytes.
+    // An adoptable destination is proven by the lock but not yet transferred,
+    // so only `adopt` may claim it. Every other provable entry is claimable.
     let provable = plan
         .entries
         .iter()
-        .filter(|entry| entry.ownership_basis().is_provable())
+        .filter(|entry| {
+            entry.ownership_basis().is_provable() && entry.action != PlanAction::Adoptable
+        })
         .map(|entry| entry.destination.as_path())
         .collect::<BTreeSet<_>>();
     receipt.assets = managed
@@ -1049,7 +1340,7 @@ fn build_receipt(
             RetainedUnmanagedAsset {
                 source_id: entry.source.clone(),
                 destination: entry.destination.clone(),
-                reason: entry.reason.clone(),
+                reason: entry.reason.message().to_owned(),
             },
         );
     }
@@ -1077,7 +1368,7 @@ fn owned_asset(entry: &ManagedDesired) -> OwnedAsset {
 }
 
 fn lifecycle_notices(
-    intent: &LifecycleIntent,
+    request: &LifecycleRequest,
     current: &[ProviderId],
     selected: &[ProviderId],
     plan: &Plan,
@@ -1115,8 +1406,8 @@ fn lifecycle_notices(
         });
     }
     if matches!(
-        intent,
-        LifecycleIntent::UninstallProvider(ProviderId::Codex)
+        request,
+        LifecycleRequest::UninstallProvider(ProviderId::Codex)
     ) && current.contains(&ProviderId::Codex)
         && !selected.is_empty()
     {

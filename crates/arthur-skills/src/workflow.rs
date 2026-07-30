@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
 
 use serde::Serialize;
 
+use crate::lifecycle::LifecycleDecision;
 use crate::plan::{Plan, PlanAction, PlanEntry};
 use crate::receipt::Receipt;
 
@@ -67,11 +66,46 @@ enum Condition {
     NotAligned,
 }
 
+/// Assesses the decision every surface received.
+///
+/// The decision already carries the receipt convergence, so a current workflow
+/// cannot hide a pending metadata commit.
+pub fn assess_decision(
+    receipt: Option<&Receipt>,
+    decision: &LifecycleDecision,
+    legacy_skills_to_import: usize,
+    legacy_skills_to_clean: usize,
+) -> WorkflowAssessment {
+    assess_with_convergence(
+        receipt,
+        &decision.plan,
+        legacy_skills_to_import,
+        legacy_skills_to_clean,
+        decision.receipt_change.required,
+    )
+}
+
 pub fn assess(
     receipt: Option<&Receipt>,
     plan: &Plan,
     legacy_skills_to_import: usize,
     legacy_skills_to_clean: usize,
+) -> WorkflowAssessment {
+    assess_with_convergence(
+        receipt,
+        plan,
+        legacy_skills_to_import,
+        legacy_skills_to_clean,
+        false,
+    )
+}
+
+fn assess_with_convergence(
+    receipt: Option<&Receipt>,
+    plan: &Plan,
+    legacy_skills_to_import: usize,
+    legacy_skills_to_clean: usize,
+    receipt_convergence: bool,
 ) -> WorkflowAssessment {
     let mut conditions = BTreeMap::<AssetKey, Condition>::new();
     for entry in &plan.entries {
@@ -115,6 +149,7 @@ pub fn assess(
         && legacy_skills_to_import == 0
         && legacy_skills_to_clean == 0
         && !plan.has_mutations()
+        && !receipt_convergence
     {
         WorkflowState::Current
     } else {
@@ -148,23 +183,19 @@ fn summarize(conditions: impl Iterator<Item = Condition>) -> AssetSummary {
     }
 }
 
+/// Classifies one entry from the decision alone: no renderer re-reads the
+/// filesystem, so the assessment always matches the plan it was built from.
 fn condition(entry: &PlanEntry) -> Condition {
     match entry.action {
         PlanAction::Create => Condition::Missing,
-        PlanAction::Drifted
-            if matches!(
-                fs::symlink_metadata(&entry.destination),
-                Err(error) if error.kind() == io::ErrorKind::NotFound
-            ) =>
-        {
-            Condition::Missing
-        }
+        PlanAction::Drifted if entry.reason.is_absent() => Condition::Missing,
         PlanAction::Update | PlanAction::Drifted | PlanAction::Conflict => Condition::NotAligned,
         PlanAction::Remove
         | PlanAction::Noop
         | PlanAction::Adoptable
         | PlanAction::RetainedUnmanaged
-        | PlanAction::RecoveryRequired => Condition::Aligned,
+        | PlanAction::RecoveryRequired
+        | PlanAction::WriteReceipt => Condition::Aligned,
     }
 }
 
@@ -205,17 +236,19 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{WorkflowState, assess};
-    use crate::plan::{Owner, OwnershipClaim, PLAN_SCHEMA_VERSION, Plan, PlanAction, PlanEntry};
+    use crate::plan::{
+        Owner, OwnershipClaim, PLAN_SCHEMA_VERSION, Plan, PlanAction, PlanEntry, PlanReason,
+    };
     use crate::provider::resolve_roots_from;
     use crate::receipt::Receipt;
 
-    fn entry(action: PlanAction, source: &str, reason: &str) -> PlanEntry {
+    fn entry(action: PlanAction, source: &str, reason: PlanReason) -> PlanEntry {
         PlanEntry {
             action,
             source: source.to_owned(),
             destination: PathBuf::from(format!("/tmp/{source}")),
             owner: Owner::Unmanaged,
-            reason: reason.to_owned(),
+            reason,
             ownership: OwnershipClaim::None,
         }
     }
@@ -229,21 +262,33 @@ mod tests {
                 entry(
                     PlanAction::Adoptable,
                     "directory:skills/meta-code",
-                    "matching",
+                    PlanReason::VerifiedLegacyAdoption,
                 ),
                 entry(
                     PlanAction::Conflict,
                     "skills/meta-code/SKILL.md",
-                    "different",
+                    PlanReason::UnmanagedConflict,
                 ),
-                entry(PlanAction::Create, "skills/new-skill/SKILL.md", "missing"),
+                entry(
+                    PlanAction::Create,
+                    "skills/new-skill/SKILL.md",
+                    PlanReason::DestinationAbsent,
+                ),
                 entry(
                     PlanAction::Adoptable,
                     "agents/claude/agent-docs.md",
-                    "matching",
+                    PlanReason::VerifiedLegacyAdoption,
                 ),
-                entry(PlanAction::Conflict, "agents/codex/docs.toml", "different"),
-                entry(PlanAction::Create, "shared/claude/support.md", "missing"),
+                entry(
+                    PlanAction::Conflict,
+                    "agents/codex/docs.toml",
+                    PlanReason::UnmanagedConflict,
+                ),
+                entry(
+                    PlanAction::Create,
+                    "shared/claude/support.md",
+                    PlanReason::DestinationAbsent,
+                ),
             ],
             operations: Vec::new(),
             diagnostics: Vec::new(),
@@ -268,7 +313,7 @@ mod tests {
             entries: vec![entry(
                 PlanAction::Create,
                 "skills/meta-code/SKILL.md",
-                "destination does not exist",
+                PlanReason::DestinationAbsent,
             )],
             operations: Vec::new(),
             diagnostics: Vec::new(),
@@ -292,7 +337,7 @@ mod tests {
             entries: vec![entry(
                 PlanAction::Noop,
                 "skills/meta-code/SKILL.md",
-                "managed path already matches",
+                PlanReason::AlreadyMatchesDesired,
             )],
             operations: Vec::new(),
             diagnostics: Vec::new(),

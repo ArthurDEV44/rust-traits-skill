@@ -331,18 +331,28 @@ fn real_cli_imports_updates_and_reports_an_aligned_configuration() -> Result<(),
         "someone/personal-skills"
     );
 
+    // A managed asset with local changes is preserved: the review disables Apply
+    // and points at the conflicting destination instead of overwriting it.
     let drifted_agent = home.path().join(".codex/agents/agent-explorer.toml");
+    let managed_agent = fs::read(&drifted_agent)?;
     fs::write(&drifted_agent, b"misaligned")?;
-    let updated = run_install_session(home.path(), &[], Interaction::Plain(b"\ny\n"))?;
-    assert_eq!(updated.exit_code, Some(0));
-    assert!(updated.output.contains("Update configuration"));
+    let blocked = run_install_session(home.path(), &[], Interaction::Plain(b"\ny\n"))?;
+    assert_eq!(blocked.exit_code, Some(3));
+    assert!(blocked.output.contains("Update configuration"));
     assert!(
-        updated
-            .output
-            .contains("Proceed with update configuration?")
+        blocked.output.contains("Application is disabled"),
+        "{}",
+        blocked.output
     );
-    assert_ne!(fs::read(&drifted_agent)?, b"misaligned");
+    assert!(
+        !blocked.output.contains("adopt"),
+        "no verified legacy candidate exists: {}",
+        blocked.output
+    );
+    assert_eq!(fs::read(&drifted_agent)?, b"misaligned");
 
+    // Restoring the recorded proof lets the same session converge again.
+    fs::write(&drifted_agent, &managed_agent)?;
     let current = run_install_session(home.path(), &[], Interaction::Plain(b"\n\n"))?;
     assert_eq!(current.exit_code, Some(0));
     assert!(current.output.contains("Everything is up to date"));

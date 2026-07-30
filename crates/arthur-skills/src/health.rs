@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::catalog::Catalog;
-use crate::lifecycle::{LifecycleIntent, prepare_lifecycle_transition};
+use crate::lifecycle::{LegacyEvidence, LifecycleRequest, decide};
 use crate::plan::PlanAction;
 use crate::platform::{effective_directory_mode, effective_file_mode, metadata_mode};
 use crate::provider::{ProviderId, ResolvedRoots};
@@ -210,14 +210,14 @@ fn inspect_catalog_coverage(
         .filter(|provider| provider.managed_integration)
         .map(|provider| provider.provider)
         .collect::<Vec<_>>();
-    let transition = match prepare_lifecycle_transition(
+    let decision = match decide(
         catalog,
         roots,
         Some(receipt),
-        &LifecycleIntent::Install { providers },
-        None,
+        &LifecycleRequest::Reconcile { providers },
+        &LegacyEvidence::Absent,
     ) {
-        Ok(transition) => transition,
+        Ok(decision) => decision,
         Err(error) => {
             issues.push(issue(
                 "catalog_inspection_failed",
@@ -228,16 +228,33 @@ fn inspect_catalog_coverage(
             return;
         }
     };
+    // A blocked decision classifies nothing, so its diagnostics are the report:
+    // an empty plan must never read as a healthy installation.
+    if !decision.applicable() && decision.plan.entries.is_empty() {
+        for diagnostic in &decision.plan.diagnostics {
+            issues.push(issue(
+                "catalog_inspection_failed",
+                IssueSeverity::Error,
+                format!("{}: {}", diagnostic.code, diagnostic.message),
+                diagnostic
+                    .path_utf8
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .map(Path::to_path_buf),
+            ));
+        }
+        return;
+    }
     let recorded = receipt
         .assets
         .iter()
         .map(|asset| asset.destination.as_path())
         .collect::<BTreeSet<_>>();
     let mut deviations = 0;
-    for entry in transition.plan.entries.iter().filter(|entry| {
+    for entry in decision.plan.entries.iter().filter(|entry| {
         !matches!(
             entry.action,
-            PlanAction::Noop | PlanAction::RetainedUnmanaged
+            PlanAction::Noop | PlanAction::RetainedUnmanaged | PlanAction::WriteReceipt
         )
     }) {
         deviations += 1;
@@ -516,6 +533,40 @@ mod tests {
         ] {
             assert!(issues.iter().any(|issue| issue.code == code));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_blocked_decision_is_reported_instead_of_a_healthy_installation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_home, roots, mut receipt) = fixture(&[ProviderId::Codex]);
+        for provider in &roots.providers {
+            fs::create_dir_all(&provider.agents)?;
+        }
+        fs::create_dir_all(&roots.state_directory)?;
+        // A file where the canonical skills container belongs blocks every
+        // decision, so the report must carry its diagnostic.
+        fs::create_dir_all(
+            roots
+                .canonical_skills
+                .parent()
+                .ok_or("canonical skills has no parent")?,
+        )?;
+        fs::write(&roots.canonical_skills, b"wrong type")?;
+        receipt.providers.iter_mut().for_each(|provider| {
+            provider.managed_integration = provider.provider == ProviderId::Codex;
+        });
+
+        let report = inspect_status(&Catalog::load()?, &roots, &receipt);
+
+        assert!(!report.healthy);
+        let blocked = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "catalog_inspection_failed")
+            .ok_or("a blocked decision must be reported")?;
+        assert_eq!(blocked.severity, IssueSeverity::Error);
+        assert!(blocked.message.contains("unsafe_container"), "{blocked:?}");
         Ok(())
     }
 

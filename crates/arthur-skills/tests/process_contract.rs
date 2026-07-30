@@ -703,7 +703,7 @@ fn matching_vercel_v3_installation_can_be_adopted_atomically() -> TestResult {
 }
 
 #[test]
-fn update_recovers_divergent_legacy_skills_and_broken_links_from_xdg_lock() -> TestResult {
+fn update_blocks_unproven_legacy_paths_then_recovers_from_the_xdg_lock() -> TestResult {
     let home = tempfile::tempdir()?;
     let install = run(
         home.path(),
@@ -769,21 +769,49 @@ fn update_recovers_divergent_legacy_skills_and_broken_links_from_xdg_lock() -> T
     fs::create_dir_all(lock_path.parent().ok_or("lock has no parent")?)?;
     fs::write(&lock_path, &legacy_lock)?;
 
+    // The lock names this skill but its bytes diverge from the bundled catalog, so
+    // the decision blocks instead of claiming an unproven path.
     let dry_run = run_with_xdg_state(
         home.path(),
         &xdg_state_home,
         &["--json", "update", "--dry-run"],
     )?;
-    assert!(
-        dry_run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&dry_run.stdout)
-    );
+    assert_eq!(dry_run.status.code(), Some(3));
     let dry_run_envelope = json_output(&dry_run)?;
-    assert_eq!(dry_run_envelope["status"], "success");
-    assert_eq!(dry_run_envelope["exit_code"], 0);
+    assert_eq!(dry_run_envelope["status"], "blocked");
+    assert_eq!(dry_run_envelope["exit_code"], 3);
     assert_eq!(dry_run_envelope["data"]["legacy_skills_to_import"], 2);
     assert_eq!(dry_run_envelope["data"]["applied"], false);
+    // The two collision families stay separate and their sum matches the detail.
+    let summary = dry_run_envelope["summary"]
+        .as_object()
+        .ok_or("summary is not an object")?;
+    assert_eq!(
+        summary["verified_legacy_candidates"],
+        summary["adoptable"].clone()
+    );
+    assert!(
+        summary["conflict"].as_u64().unwrap_or_default() > 0,
+        "{summary:?}"
+    );
+    let unproven = dry_run_envelope["diagnostics"]
+        .as_array()
+        .ok_or("diagnostics are not an array")?
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "legacy_entry_does_not_match_catalog")
+        .ok_or("the divergent legacy path has no diagnostic")?;
+    assert_eq!(unproven["source_id"], "coss");
+    assert_eq!(
+        unproven["path_utf8"].as_str(),
+        legacy_coss_file.to_str(),
+        "{unproven}"
+    );
+    assert!(
+        unproven["remediation"]
+            .as_str()
+            .is_some_and(|remediation| remediation.contains("Move or remove")),
+        "{unproven}"
+    );
     assert_eq!(fs::read(&legacy_coss_file)?, b"legacy catalog bytes");
     assert!(
         !home
@@ -791,6 +819,24 @@ fn update_recovers_divergent_legacy_skills_and_broken_links_from_xdg_lock() -> T
             .join(".agents/.arthur-workflow/vercel-skills-v3-lock-2.json")
             .exists()
     );
+
+    // Confirming the same blocked decision still mutates nothing.
+    let blocked_apply =
+        run_with_xdg_state(home.path(), &xdg_state_home, &["--json", "update", "--yes"])?;
+    assert_eq!(blocked_apply.status.code(), Some(3));
+    assert_eq!(json_output(&blocked_apply)?["status"], "blocked");
+    assert_eq!(fs::read(&legacy_coss_file)?, b"legacy catalog bytes");
+    assert!(
+        !home
+            .path()
+            .join(".agents/.arthur-workflow/vercel-skills-v3-lock-2.json")
+            .exists()
+    );
+
+    // The documented remediation: move or remove every unproven path, then retry.
+    fs::remove_dir_all(home.path().join(".agents/skills/coss"))?;
+    fs::remove_file(home.path().join(".claude/skills/coss"))?;
+    fs::remove_file(home.path().join(".claude/skills/coss-particles"))?;
 
     let update = run_with_xdg_state(home.path(), &xdg_state_home, &["--json", "update", "--yes"])?;
     assert!(
@@ -800,6 +846,14 @@ fn update_recovers_divergent_legacy_skills_and_broken_links_from_xdg_lock() -> T
     );
     assert!(home.path().join(".agents/skills/coss/SKILL.md").is_file());
     assert_ne!(fs::read(&legacy_coss_file)?, b"legacy catalog bytes");
+    // A second run converges to a no-op without touching the receipt again.
+    let second = run_with_xdg_state(home.path(), &xdg_state_home, &["--json", "update", "--yes"])?;
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert_eq!(json_output(&second)?["status"], "noop");
     assert!(
         home.path()
             .join(".agents/skills/coss-particles/SKILL.md")
@@ -841,6 +895,145 @@ fn update_recovers_divergent_legacy_skills_and_broken_links_from_xdg_lock() -> T
         )?,
         legacy_lock
     );
+    Ok(())
+}
+
+/// Normalizes an envelope to what every lifecycle surface must agree on.
+fn decision_projection(envelope: &Value) -> Value {
+    serde_json::json!({
+        "status": envelope["status"],
+        "exit_code": envelope["exit_code"],
+        "summary": envelope["summary"],
+        "operations": envelope["operations"],
+        "diagnostics": envelope["diagnostics"]
+            .as_array()
+            .map(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic["severity"] != "warning")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+#[test]
+fn plan_and_both_dry_runs_project_one_decision() -> TestResult {
+    let home = tempfile::tempdir()?;
+    let install = run(
+        home.path(),
+        &["--json", "install", "--provider", "claude,codex", "--yes"],
+    )?;
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stdout)
+    );
+    let receipt_path = home.path().join(".agents/.arthur-workflow/receipt.json");
+
+    let read_only = [
+        vec!["--json", "plan", "--provider", "claude,codex"],
+        vec![
+            "--json",
+            "install",
+            "--provider",
+            "claude,codex",
+            "--dry-run",
+        ],
+        vec!["--json", "update", "--dry-run"],
+    ];
+
+    // A receipt whose catalog fingerprint is stale converges through the same
+    // visible receipt-only operation on every surface.
+    let mut receipt = serde_json::from_slice::<Value>(&fs::read(&receipt_path)?)?;
+    receipt["catalog_sha256"] = Value::String("b".repeat(64));
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+    let before = fs::read(&receipt_path)?;
+
+    let mut projections = Vec::new();
+    for arguments in &read_only {
+        let output = run(home.path(), arguments)?;
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let envelope = json_output(&output)?;
+        assert_eq!(envelope["summary"]["write_receipt"], 1, "{arguments:?}");
+        projections.push(decision_projection(&envelope));
+    }
+    assert_eq!(projections[0], projections[1]);
+    assert_eq!(projections[1], projections[2]);
+    // Every read-only surface stays read-only.
+    assert_eq!(fs::read(&receipt_path)?, before);
+
+    // A destination the receipt no longer proves is a blocked conflict, and the
+    // three surfaces still report exactly the same decision.
+    let mut receipt = serde_json::from_slice::<Value>(&fs::read(&receipt_path)?)?;
+    let removed = receipt["assets"]
+        .as_array_mut()
+        .ok_or("receipt assets are not an array")?
+        .iter()
+        .position(|asset| {
+            asset["source_id"]
+                .as_str()
+                .is_some_and(|source| source == "skills/baseline-ui/SKILL.md")
+        })
+        .ok_or("the managed skill file is absent from the receipt")?;
+    let unproven = receipt["assets"]
+        .as_array_mut()
+        .ok_or("receipt assets are not an array")?
+        .remove(removed);
+    let unproven_path = unproven["destination"]
+        .as_str()
+        .ok_or("the removed destination is not UTF-8")?
+        .to_owned();
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+
+    let mut projections = Vec::new();
+    for arguments in &read_only {
+        let output = run(home.path(), arguments)?;
+        assert_eq!(output.status.code(), Some(3), "{arguments:?}");
+        let envelope = json_output(&output)?;
+        assert_eq!(envelope["status"], "blocked", "{arguments:?}");
+        let diagnostic = envelope["diagnostics"]
+            .as_array()
+            .ok_or("diagnostics are not an array")?
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == "matching_unmanaged_without_proof")
+            .ok_or("the unproven destination has no diagnostic")?
+            .clone();
+        assert_eq!(diagnostic["path_utf8"], unproven_path);
+        assert!(
+            diagnostic["remediation"]
+                .as_str()
+                .is_some_and(|remediation| remediation.contains("Move or remove")),
+            "{diagnostic}"
+        );
+        let conflict = envelope["operations"]
+            .as_array()
+            .ok_or("operations are not an array")?
+            .iter()
+            .find(|operation| operation["destination_utf8"] == unproven_path)
+            .ok_or("the unproven destination has no plan entry")?;
+        assert_eq!(conflict["action"], "conflict");
+        assert_eq!(conflict["ownership_basis"], "none");
+        assert_eq!(conflict["reason_code"], "matching_unmanaged_without_proof");
+        assert_eq!(envelope["summary"]["matching_unmanaged"], 1);
+        projections.push(decision_projection(&envelope));
+    }
+    assert_eq!(projections[0], projections[1]);
+    assert_eq!(projections[1], projections[2]);
+
+    // The human surface names the unowned path and never labels it as adoptable.
+    let human = run(
+        home.path(),
+        &["--plain", "plan", "--provider", "claude,codex"],
+    )?;
+    let human = String::from_utf8(human.stdout)?;
+    assert!(human.contains("matching unmanaged"), "{human}");
+    assert!(!human.contains("Adopt"), "{human}");
     Ok(())
 }
 
