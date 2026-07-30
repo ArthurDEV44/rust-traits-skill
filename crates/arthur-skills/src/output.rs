@@ -5,7 +5,10 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::plan::{DiagnosticSeverity as PlanSeverity, Owner, Plan, PlanAction, PlanEntry};
+use crate::plan::{
+    DiagnosticSeverity as PlanSeverity, MATCHING_UNMANAGED_WITHOUT_PROOF, Owner, Plan, PlanAction,
+    PlanEntry,
+};
 use crate::platform::path_key;
 use crate::provider::{ENVIRONMENT_EXIT_CODE, ProviderId};
 
@@ -315,9 +318,7 @@ impl Envelope {
                 message: diagnostic.message.clone(),
                 path_utf8: diagnostic.path_utf8.clone(),
                 path_bytes_hex: diagnostic.path_bytes_hex.clone(),
-                remediation: Some(
-                    "Resolve the reported path before applying this plan.".to_owned(),
-                ),
+                remediation: Some(plan_remediation(&diagnostic.code).to_owned()),
             }));
         if !plan.applicable {
             self.status = OutputStatus::Blocked;
@@ -335,6 +336,15 @@ impl Envelope {
         }
         self
     }
+}
+
+/// A matching path without proof is resolved by moving it aside, never by
+/// adopting it: only a verified legacy entry can transfer ownership.
+fn plan_remediation(code: &str) -> &'static str {
+    if code == MATCHING_UNMANAGED_WITHOUT_PROOF {
+        return "Move or remove this matching unmanaged path, then run plan again.";
+    }
+    "Resolve the reported path before applying this plan."
 }
 
 pub fn clap_envelope(command: Option<&str>, error: &clap::Error) -> Envelope {
@@ -576,9 +586,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        ENVIRONMENT_EXIT_CODE, Envelope, OutputDiagnostic, OutputOperation, OutputSeverity,
-        OutputStatus, USAGE_EXIT_CODE, asset_changes, path_fields, write_human,
-        write_human_compact, write_json,
+        ENVIRONMENT_EXIT_CODE, Envelope, MATCHING_UNMANAGED_WITHOUT_PROOF, OutputDiagnostic,
+        OutputOperation, OutputSeverity, OutputStatus, USAGE_EXIT_CODE, asset_changes, path_fields,
+        write_human, write_human_compact, write_json,
     };
     use crate::plan::{
         Diagnostic, DiagnosticSeverity, Owner, OwnershipClaim, Plan, PlanAction, PlanEntry,
@@ -667,6 +677,44 @@ mod tests {
         assert!(output.contains("done"));
         assert!(output.contains("unsafe_path: unsafe destination"));
         assert_eq!(path_fields(&non_utf8).0, None);
+    }
+
+    #[test]
+    fn a_matching_unmanaged_path_is_never_remediated_by_adopt() {
+        let plan = Plan {
+            schema_version: 1,
+            applicable: false,
+            entries: vec![PlanEntry {
+                action: PlanAction::Conflict,
+                source: "skills/example/SKILL.md".to_owned(),
+                destination: PathBuf::from("/home/user/.agents/skills/example/SKILL.md"),
+                owner: Owner::Unmanaged,
+                reason: "matching unmanaged asset has no ownership proof".to_owned(),
+                ownership: OwnershipClaim::None,
+            }],
+            operations: Vec::<PlannedMutation>::new(),
+            diagnostics: vec![Diagnostic {
+                code: MATCHING_UNMANAGED_WITHOUT_PROOF.to_owned(),
+                severity: DiagnosticSeverity::Error,
+                message: "matching unmanaged asset has no ownership proof".to_owned(),
+                path_utf8: Some("/home/user/.agents/skills/example/SKILL.md".to_owned()),
+                path_bytes_hex: None,
+            }],
+        };
+
+        let envelope = Envelope::new(Some("plan")).with_plan(&plan);
+
+        assert_eq!(envelope.status, OutputStatus::Blocked);
+        let diagnostic = &envelope.diagnostics[0];
+        assert_eq!(
+            diagnostic.remediation.as_deref(),
+            Some("Move or remove this matching unmanaged path, then run plan again.")
+        );
+        let mut output = Vec::new();
+        assert!(write_human(&envelope, &mut output).is_ok());
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(rendered.contains("matching unmanaged"));
+        assert!(!rendered.contains("adopt"), "{rendered}");
     }
 
     #[test]

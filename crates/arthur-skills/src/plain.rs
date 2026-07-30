@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Write};
 
-use crate::app::{Action, App, Outcome, Provider, Step};
+use crate::app::{Action, App, Outcome, Provider, Step, blocked_review_remediation};
 use crate::output::{asset_changes, pending_action_label};
 use crate::transaction::SignalFlags;
 use crate::workflow::WorkflowState;
@@ -65,7 +65,11 @@ pub fn confirm_plan(
     if !app.review().is_some_and(|review| review.applicable) {
         writeln!(
             output,
-            "Application disabled: resolve conflicts or run adopt."
+            "{}",
+            blocked_review_remediation(
+                app.review()
+                    .map_or(0, |review| review.verified_legacy_candidates)
+            )
         )?;
         return Ok(PlainExit::Cancelled);
     }
@@ -320,7 +324,13 @@ mod tests {
             ),
             Ok(PlainExit::Cancelled)
         ));
-        assert!(String::from_utf8_lossy(&output).contains("Application disabled"));
+        let disabled = String::from_utf8_lossy(&output);
+        assert!(disabled.contains("Application is disabled"));
+        assert!(
+            disabled.contains("move or remove the conflicting destination"),
+            "a plan without a verified legacy candidate must not point at adopt: {disabled}"
+        );
+        assert!(!disabled.contains("adopt"));
 
         let mut review_output = Vec::new();
         assert!(render_review(&App::new(1, &[]), &mut review_output).is_ok());
@@ -328,6 +338,7 @@ mod tests {
 
         let mut app = App::new(1, &[]);
         app.set_review(Review {
+            verified_legacy_candidates: 0,
             groups: Default::default(),
             applicable: true,
             notices: Vec::new(),
@@ -363,6 +374,7 @@ mod tests {
         ];
         let mut app = App::new(1, &[]);
         app.set_review(Review {
+            verified_legacy_candidates: 0,
             groups: [(
                 ("/home/user".to_owned(), PlanAction::Update),
                 entries.into_iter().collect(),

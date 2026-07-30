@@ -400,6 +400,9 @@ fn render_review(frame: &mut Frame<'_>, app: &App, colors: bool) {
     );
     render_message(frame, app.message(), message, colors);
     let applicable = app.review().is_some_and(|review| review.applicable);
+    let verified_legacy = app
+        .review()
+        .map_or(0, |review| review.verified_legacy_candidates);
     let action = if let Some(assessment) = assessment {
         assessment.state.action()
     } else if applicable {
@@ -408,7 +411,8 @@ fn render_review(frame: &mut Frame<'_>, app: &App, colors: bool) {
         "disabled"
     };
     frame.render_widget(
-        Paragraph::new(review_footer(action, applicable, colors)).wrap(Wrap { trim: false }),
+        Paragraph::new(review_footer(action, applicable, verified_legacy, colors))
+            .wrap(Wrap { trim: false }),
         footer,
     );
 }
@@ -567,12 +571,21 @@ fn selection_footer(colors: bool) -> Line<'static> {
     )
 }
 
-fn review_footer(action: &str, applicable: bool, colors: bool) -> Line<'static> {
+fn review_footer(
+    action: &str,
+    applicable: bool,
+    verified_legacy_candidates: usize,
+    colors: bool,
+) -> Line<'static> {
     if !applicable {
         return Line::from(vec![
             "  ".into(),
             Span::styled(
-                "Apply disabled: resolve conflicts or run adopt",
+                if verified_legacy_candidates > 0 {
+                    "Apply disabled: resolve conflicts or adopt the verified legacy entries"
+                } else {
+                    "Apply disabled: move or remove the conflicting destinations"
+                },
                 if colors {
                     Style::default().fg(Color::Red)
                 } else {
@@ -959,6 +972,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut app = App::with_selection(50, &[Provider::Claude, Provider::Codex]);
         app.set_review(Review {
+            verified_legacy_candidates: 0,
             groups: [(
                 ("/home/user/.agents/skills".to_owned(), PlanAction::Update),
                 vec![PlanEntry {
@@ -1018,6 +1032,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut app = App::with_selection(50, &[Provider::Claude, Provider::Codex]);
         app.set_review(Review {
+            verified_legacy_candidates: 0,
             groups: Default::default(),
             applicable: true,
             notices: vec![LifecycleNotice {

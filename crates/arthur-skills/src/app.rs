@@ -38,6 +38,8 @@ pub struct Review {
     pub applicable: bool,
     pub notices: Vec<LifecycleNotice>,
     pub assessment: Option<WorkflowAssessment>,
+    /// Verified legacy candidates, the only case where `adopt` can succeed.
+    pub verified_legacy_candidates: usize,
 }
 
 impl Review {
@@ -80,7 +82,22 @@ impl Review {
             applicable: plan.applicable,
             notices: notices.to_vec(),
             assessment,
+            verified_legacy_candidates: plan
+                .entries
+                .iter()
+                .filter(|entry| entry.action == PlanAction::Adoptable)
+                .count(),
         }
+    }
+}
+
+/// Never point at `adopt` unless a verified legacy candidate exists: a matching
+/// unmanaged path is resolved by moving or removing it.
+pub const fn blocked_review_remediation(verified_legacy_candidates: usize) -> &'static str {
+    if verified_legacy_candidates > 0 {
+        "Application is disabled until every conflict is resolved; adopt the verified legacy entries or move the conflicting destination."
+    } else {
+        "Application is disabled until every conflict is resolved; move or remove the conflicting destination, then run plan again."
     }
 }
 
@@ -138,8 +155,12 @@ impl App {
             }
             Action::Confirm => {
                 self.message = Some(
-                    "Application is disabled until every conflict is resolved; use adopt or remove the conflicting destination."
-                        .to_owned(),
+                    blocked_review_remediation(
+                        self.review
+                            .as_ref()
+                            .map_or(0, |review| review.verified_legacy_candidates),
+                    )
+                    .to_owned(),
                 );
             }
             Action::Cancel => return Outcome::Cancelled,
@@ -238,6 +259,7 @@ mod tests {
         assert!(app.enabled(1));
         assert_eq!(app.selection_summary(), "Codex");
         app.set_review(Review {
+            verified_legacy_candidates: 0,
             groups: Default::default(),
             applicable: false,
             notices: Vec::new(),
