@@ -6,6 +6,7 @@
 | Version | Date | Author | Summary |
 |---------|------|--------|---------|
 | 1.0 | 2026-07-30 | Arthur Jean | Correctif du contrat de provenance, de planification, d'adoption et de convergence du receipt |
+| 1.1 | 2026-07-30 | Arthur Jean | EP-002: précision de la classification d'un chemin absent et du receipt commit lié à une réécriture de lock vérifié |
 
 ## Problem Statement
 
@@ -183,6 +184,11 @@ Remplacer l'inférence depuis le filesystem par une provenance fermée, puis bor
 Construire une décision de cycle de vie canonique et la faire consommer sans divergence par chaque commande, renderer et opération de control plane.
 
 **Definition of Done:** une même requête produit un seul graphe de décision, le receipt projeté en fait partie, et toutes les surfaces affichent les mêmes actions, blockers, provenances et remédiations.
+
+**Amendements constatés pendant l'implémentation (v1.1):**
+
+- Un chemin désiré absent est classé `create` même lorsqu'un receipt le prouvait: rien n'est écrasé, la précondition de l'opération reste `Missing` et la claim vaut `created_in_transaction`. `drifted` est réservé aux chemins présents qui diffèrent à la fois de leur preuve et du catalogue (US-002 AC1 prévaut sur une lecture élargie de US-002 AC5).
+- La transaction impose exactement une opération de receipt. Une requête qui archive et réécrit un lock v3 vérifié planifie donc explicitement `WriteReceipt` (`ReceiptChangeReason::LegacyLockRewrite`), sans quoi la mutation du lock resterait sans enregistrement transactionnel. US-006 AC3 continue de s'appliquer aux requêtes sans mutation externe.
 
 #### US-004: Construire une LifecycleDecision canonique
 
