@@ -1,6 +1,6 @@
 ---
 name: implement-epic
-description: "Implement or finish one PRD epic (`EP-NNN`) end to end, from scoped requirements through code, review, final validation, and status roll-up. Use when asked to implement, complete, or certify an epic. Routes external research only when a current or version-sensitive fact can change implementation or tests, and certifies `DONE` only from evidence on the final repository state."
+description: "Implement or finish one PRD epic (`EP-NNN`) end to end, from scoped requirements through code, wiring proof, and final validation, then hand off for certification. Use when asked to implement, complete, or finish an epic. Routes external research only when a current or version-sensitive fact can change implementation or tests, and hands off at `IN_REVIEW` without ever certifying `DONE`."
 ---
 
 # implement-epic
@@ -9,11 +9,13 @@ Implement: $ARGUMENTS
 
 ## Objective
 
-Finish one epic with the smallest workflow that proves every requirement.
+Finish one epic with the smallest workflow that proves every requirement from a real execution path.
 
-`SCOPE -> [GROUND if needed] -> IMPLEMENT -> REVIEW -> VERIFY/STATUS`
+`SCOPE -> [GROUND if needed] -> IMPLEMENT -> VERIFY/HANDOFF`
 
 Work autonomously through ordinary implementation choices and repairable failures. Report only meaningful milestones, scope changes, or blockers.
+
+This skill never certifies. It owns `TODO -> IN_PROGRESS -> IN_REVIEW` and hands the epic to `review-epic`, which alone writes `DONE`, `BLOCKED`, or a downgrade.
 
 ## Profiles
 
@@ -29,16 +31,17 @@ File count alone does not select DEEP.
 
 ## Phase 1: SCOPE
 
-1. Resolve the PRD path, epic ID, and optional profile. If no epic is named, select the first epic with incomplete stories.
+1. Resolve the PRD path, epic ID, and optional profile. If no epic is named, select the first epic with `TODO`, `IN_PROGRESS`, or `BLOCKED` stories.
 2. Read the PRD, adjacent status data, repository guidance, and only the code needed to locate integration points.
-3. Extract the outcome, non-goals, incomplete child stories, dependencies, acceptance criteria, explicit quality gates, and current statuses. Exclude `DONE` and `CANCELLED` stories unless revalidation was requested.
+3. Extract the outcome, non-goals, incomplete child stories, dependencies, acceptance criteria, explicit quality gates, and current statuses. Exclude `DONE`, `IN_REVIEW`, and `CANCELLED` stories unless reimplementation was requested.
 4. Order incomplete stories by dependency. Inspect an incomplete dependency before calling it external or blocking.
 5. Capture branch, HEAD, worktree state, and the epic baseline. Preserve unrelated changes.
 6. Inspect implicated manifests and lockfiles. Map every candidate file and acceptance criterion to a story or shared integration point.
-7. Create a compact evidence map with only: story or criterion, expected implementation path, proving test or observation, and status. Do not create a new file unless the repository already uses one.
-8. For each unresolved question, classify `source_need` as `none`, `codebase`, `docs`, or `web`.
+7. Identify the execution roots the epic must plug into: route table, command registry, rendered component tree, dependency container, migration list, scheduler, event subscriptions, config readers, or public package exports.
+8. Create a compact evidence map with only: story or criterion, expected implementation path, entry point that reaches it, proving test or observation, and status. Do not create a new file unless the repository already uses one.
+9. For each unresolved question, classify `source_need` as `none`, `codebase`, `docs`, or `web`.
 
-**Gate:** Scope, dependency order, baseline, risk profile, and criterion-to-proof paths are explicit.
+**Gate:** Scope, dependency order, baseline, risk profile, execution roots, and criterion-to-proof paths are explicit.
 
 ## Conditional GROUND
 
@@ -66,24 +69,17 @@ Rules:
 
 1. Set the epic, PRD, and first eligible story to `IN_PROGRESS` when the repository tracks those states.
 2. Implement incomplete stories in dependency order. Read before editing and batch adjacent work that shares an integration point.
-3. Add or update tests that prove acceptance criteria, relevant unhappy paths, boundaries, and repaired regressions.
-4. Run focused checks during implementation when they resolve an active ambiguity or protect a contract needed by later work.
-5. Update the evidence map as criteria gain concrete proof. Do not mark stories `DONE`.
-6. Keep changes inside the scoped epic. If implementation exposes a product-level contradiction, stop and report it. If it exposes only a technical correction, update the plan and continue.
+3. Wire every new behavior into a real execution path in the same pass, using the roots identified in SCOPE. Wiring is part of the story, not a follow-up. An exported symbol nothing calls is unfinished work, not perfectible code.
+4. When new code replaces an existing path, remove or redirect the old path. Leaving both wired means runtime behavior did not change despite a complete diff.
+5. Make every added config key, environment variable, or feature flag actually read, with its default present in the manifest the project really loads.
+6. Add or update tests that prove acceptance criteria, relevant unhappy paths, boundaries, and repaired regressions. At least one proof per criterion must start from the real entry point. A unit test on the new module alone does not prove the criterion.
+7. Run focused checks during implementation when they resolve an active ambiguity or protect a contract needed by later work.
+8. Update the evidence map as criteria gain concrete proof.
+9. Keep changes inside the scoped epic. If implementation exposes a product-level contradiction, stop and report it. If it exposes only a technical correction, update the plan and continue.
 
-**Gate:** Every eligible story is implemented, every criterion has a proof path, and the changed surface matches the epic.
+**Gate:** Every eligible story is implemented, every criterion has a proof path starting at a real entry point, every symbol the epic adds has a referent outside its own module and outside tests, no replaced path stays wired, and the changed surface matches the epic.
 
-## Phase 3: REVIEW
-
-1. Review the complete epic diff from the baseline against the outcome, criteria, repository conventions, integration contracts, error paths, security boundaries, and regression risks.
-2. Validate every finding against exact local evidence. Ignore unsupported speculation and taste-only preferences.
-3. Fix every confirmed in-scope correctness, security, scope, or regression issue. Add a regression test when mechanically testable.
-4. Inspect each repair and its immediate callers.
-5. For DEEP only, use at most one independent review mode when a distinct high-risk axis justifies fresh context. Choose correctness or security, not both. The orchestrator validates every returned finding before acting.
-
-**Gate:** The final diff has no unresolved confirmed in-scope finding.
-
-## Phase 4: VERIFY/STATUS
+## Phase 3: VERIFY/HANDOFF
 
 After the last code change, run one coherent final validation bundle:
 
@@ -94,16 +90,16 @@ After the last code change, run one coherent final validation bundle:
 5. The relevant full suite when required by the PRD, the profile is DEEP, a public contract changed, or regression scope cannot be bounded.
 6. Existing security or supply-chain checks when manifests, trust boundaries, or sensitive behavior changed.
 
-If validation fails, fix the root cause, inspect the repair, rerun the failed and impacted checks, then rerun the final bundle required by the resulting state. Only the successful bundle after the last change is certification evidence.
+If validation fails, fix the root cause, inspect the repair, rerun the failed and impacted checks, then rerun the final bundle required by the resulting state. Only the successful bundle after the last change is handoff evidence.
 
 Then:
 
-1. Map every acceptance criterion to current `file:line`, test, command, artifact, or explicit manual observation.
+1. Map every acceptance criterion to current `file:line`, its entry point, and a test, command, artifact, or explicit manual observation.
 2. Confirm the final diff contains only scoped epic work and preserves unrelated user changes.
-3. Mark a child story `DONE` only when all its criteria are proven. Mark manual proof as manual.
-4. Roll up timestamps, counters, epic status, and PRD status. Validate the tracker using an existing repository check when available.
-5. Print `STATUS DONE` only when every non-cancelled child is proven on the final state.
-6. Return a compact receipt: epic and profile, scope corrections, completed stories, criterion evidence, changed files, final validation results, review repairs, status changes, and blockers.
+3. Set every implemented non-cancelled child story to `IN_REVIEW`. Mark manual proof as manual. Never set a story, epic, or PRD to `DONE`.
+4. Roll up timestamps, counters, and epic status to `IN_REVIEW`. Leave `completed_at` unset; it belongs to certification. Validate the tracker using an existing repository check when available.
+5. Print `STATUS IN_REVIEW` when every non-cancelled child is implemented, wired, and validated. Print `STATUS BLOCKED` otherwise.
+6. Return a compact receipt: epic and profile, scope corrections, implemented stories, criterion evidence with entry points, changed files, final validation results, status changes, blockers, and the `review-epic` invocation to run next.
 
 ## Failure Handling
 
@@ -114,22 +110,25 @@ Then:
 | Same cause survives two distinct repair approaches | Report `BLOCKED` unless a new observable fact changes the diagnosis |
 | Repair changes code after validation | Invalidate only dependent evidence and produce a new final bundle for the resulting state |
 | Credentials, permissions, external systems, or human-only proof are required | Preserve truthful state and report the exact blocker |
-| Epic is already `DONE` | Stop unless reimplementation or revalidation was explicitly requested |
+| Behavior cannot be wired without an unapproved architectural decision | Report the exact wiring gap; do not ship an orphaned module as complete |
+| Epic is already `IN_REVIEW` or `DONE` | Stop and point to `review-epic` unless reimplementation was explicitly requested |
 
 ## Done When
 
-- Every non-cancelled story and acceptance criterion has current evidence.
+- Every non-cancelled story and acceptance criterion has current evidence reachable from a real entry point.
+- Every symbol the epic adds has a non-test referent, and no replaced path stays wired.
 - The complete final validation bundle passes after the last code change.
-- The final diff is reviewed and contains no unresolved confirmed in-scope issue.
 - External facts used by the implementation have real source pointers.
-- Story, epic, PRD, timestamps, and counters are consistent.
+- Story, epic, PRD, timestamps, and counters are consistent at `IN_REVIEW`.
 - No blocker or residual uncertainty is hidden.
 
 ## Constraints
 
 - Preserve the epic boundary, repository conventions, and unrelated user work.
 - Prefer local evidence and deterministic checks over model assertions.
-- Never weaken tests, fabricate proof, or claim `DONE` from an earlier code state.
+- Never weaken tests, fabricate proof, or claim validation from an earlier code state.
+- Never mark a story, epic, or PRD `DONE`. Certification belongs to `review-epic`.
+- Do not audit style, abstraction quality, or maintainability. Fix only what blocks a criterion; leave quality judgement to review.
 - Never commit, push, publish, perform destructive external actions, or expand product scope without explicit authorization.
 
 ## Examples

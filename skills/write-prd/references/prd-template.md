@@ -267,13 +267,13 @@ Each story carries inline metadata:
     "file": "tasks/prd-{name}.md",
     "title": "{Feature Name}",
     "created_at": "{YYYY-MM-DD}",
-    "status": "DRAFT | READY | IN_PROGRESS | DONE"
+    "status": "DRAFT | READY | IN_PROGRESS | IN_REVIEW | DONE"
   },
   "epics": [
     {
       "id": "EP-001",
       "title": "{Epic Title}",
-      "status": "TODO | IN_PROGRESS | DONE",
+      "status": "TODO | IN_PROGRESS | IN_REVIEW | DONE | BLOCKED",
       "priority": "P0 | P1 | P2",
       "stories_total": 4,
       "stories_done": 0
@@ -299,35 +299,40 @@ Each story carries inline metadata:
 ### Status Transitions
 
 ```
-TODO → IN_PROGRESS → IN_REVIEW
-  |         |              |
-  |         └──────────────→ DONE
-  └→ BLOCKED
-  |
-  └→ CANCELLED
+TODO → IN_PROGRESS → IN_REVIEW → DONE
+                          ↑          |
+                          └──────────┘   downgrade on disproven completion
+
+Any → BLOCKED → TODO
+Any → CANCELLED
 ```
 
+Ownership is strict: `/implement-epic` owns `TODO` → `IN_PROGRESS` → `IN_REVIEW` and never writes `DONE`. `/review-epic` alone writes `DONE`, the `DONE` → `IN_REVIEW` downgrade, and `BLOCKED`. Certification never comes from the skill that wrote the code.
+
 - `TODO` → `IN_PROGRESS`: when `/implement-epic` starts the matching story slice in Phase 2
-- `IN_PROGRESS` → `IN_REVIEW`: when a story still needs manual verification after `/implement-epic` validation
-- `IN_PROGRESS` or `IN_REVIEW` → `DONE`: when `/implement-epic` or `/review-epic` proves every story criterion and no manual verification remains
+- `IN_PROGRESS` → `IN_REVIEW`: when `/implement-epic` has implemented the story, wired it into a real execution path, and passed its final validation bundle. Implementation is complete but uncertified.
+- `IN_REVIEW` → `DONE`: when `/review-epic` proves every criterion from a real entry point, required gates pass, and no blocking finding remains
 - `DONE` → `IN_REVIEW`: when `/review-epic` disproves completion or leaves required manual verification
-- Any → `BLOCKED`: when a dependency, irreversible decision, or repeated technical failure prevents further work
+- Any → `BLOCKED`: when a dependency, irreversible decision, unresolvable wiring gap, or repeated technical failure prevents further work
 - `BLOCKED` → `TODO`: when blocker is resolved
 - Any → `CANCELLED`: manual decision
 
-`/review-epic` sets `reviewed_at` on every reviewed, non-cancelled child story and then recalculates story, epic, and PRD roll-ups.
+`/implement-epic` leaves `completed_at` unset; it belongs to certification. `/review-epic` sets `reviewed_at` on every reviewed, non-cancelled child story, sets `completed_at` on newly certified stories, and then recalculates story, epic, and PRD roll-ups.
 
 ### Epic Status Roll-up
 
 - `TODO`: no stories started
-- `IN_PROGRESS`: at least one story started, not all done
-- `DONE`: all stories DONE or CANCELLED
+- `IN_PROGRESS`: at least one story started, at least one non-cancelled story below `IN_REVIEW`
+- `IN_REVIEW`: every non-cancelled story is `IN_REVIEW` or `DONE`, and at least one is not `DONE`
+- `DONE`: all stories DONE or CANCELLED, written only by `/review-epic`
+- `BLOCKED`: at least one non-cancelled story is BLOCKED and no further progress is possible
 
 ### PRD Status
 
 - `DRAFT`: during brainstorming and writing
 - `READY`: user approved, ready for implementation
 - `IN_PROGRESS`: at least one story started
+- `IN_REVIEW`: every epic is `IN_REVIEW` or `DONE`, and at least one is not `DONE`
 - `DONE`: all epics DONE
 
 ---
@@ -338,10 +343,10 @@ TODO → IN_PROGRESS → IN_REVIEW
 /write-prd                    → produces PRD + status.json
      |
      v
-/implement-epic [prd] [EP-NNN]   → implements one epic through ordered story slices, updates roll-up status
+/implement-epic [prd] [EP-NNN]   → implements and wires one epic through ordered story slices, hands off at IN_REVIEW
      |
      v
-/review-epic [prd] [EP-NNN]      → reviews and corrects one implemented epic, updates status roll-ups
+/review-epic [prd] [EP-NNN]      → proves wiring, audits, remediates, certifies DONE, updates status roll-ups
      |
      v
 /security-review                  → optional standalone security audit outside the epic workflow
